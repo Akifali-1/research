@@ -193,6 +193,80 @@ def validate_completed_artifacts(record):
         raise RuntimeError(f"Completed run artifacts are missing/changed: {record['experiment_id']}; do not retrain silently")
 
 
+def validate_training_commit_compatibility(root, training_commit, evaluation_commit):
+    """Allow only the specifically reviewed logging-only commit transition."""
+    if training_commit == evaluation_commit:
+        return {
+            "mode": "exact_commit",
+            "training_commit": training_commit,
+            "evaluation_commit": evaluation_commit,
+        }
+
+    approved_training = "ac172c779ae0c5194d9e7190c7369bd6f7fbb42e"
+    logging_commit = "db84e9ebdf0bdcdb44bbaaec3207b2d64e9da2e9"
+    expected_paths = {
+        "README.md",
+        "orchestrator.py",
+        "src/process_runner.py",
+        "src/train.py",
+        "tests/test_process_runner.py",
+    }
+
+    if training_commit != approved_training:
+        raise ValueError(
+            f"Unapproved training commit for compatibility exception: {training_commit}"
+        )
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", str(root), *args], text=True
+        ).strip()
+
+    def is_ancestor(ancestor, descendant):
+        result = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor",
+             ancestor, descendant],
+            capture_output=True,
+        )
+        return result.returncode == 0
+
+    if not is_ancestor(training_commit, logging_commit):
+        raise ValueError("Approved logging commit is not based on the training commit")
+    if not is_ancestor(logging_commit, evaluation_commit):
+        raise ValueError("Evaluation commit does not descend from the approved logging commit")
+
+    original_changes = set(
+        git("diff", "--name-only", training_commit, logging_commit).splitlines()
+    )
+    if original_changes != expected_paths:
+        raise ValueError(
+            f"Logging commit changed unexpected files: {sorted(original_changes)}"
+        )
+
+    # Require exactly one additional commit: the reviewed compatibility patch.
+    if git("rev-list", "--count", f"{logging_commit}..{evaluation_commit}") != "1":
+        raise ValueError("Expected exactly one compatibility-patch commit after the logging commit")
+    if git("rev-parse", f"{evaluation_commit}^") != logging_commit:
+        raise ValueError("Compatibility patch must be a direct child of the logging commit")
+
+    patch_paths = set(
+        git("diff", "--name-only", logging_commit, evaluation_commit).splitlines()
+    )
+    if patch_paths != {"orchestrator.py"}:
+        raise ValueError(
+            f"Compatibility patch may change only orchestrator.py: {sorted(patch_paths)}"
+        )
+
+    return {
+        "mode": "approved_logging_only",
+        "training_commit": training_commit,
+        "evaluation_commit": evaluation_commit,
+        "approved_logging_commit": logging_commit,
+        "reviewed_changed_paths": sorted(original_changes),
+        "compatibility_patch_paths": sorted(patch_paths),
+    }
+
+
 def prepare_data(root, config_path, raw_dir, processed_base, branch=None):
     """Colab preprocessing stage; versioned output, durable log, completion marker."""
     require_colab_drive(raw_dir, processed_base)
@@ -253,9 +327,15 @@ def finalize_test(root, config_path, raw_dir, registry_path, experiment_ids, bra
     selected = [record for record in state["experiments"] if record["experiment_id"] in set(experiment_ids)]
     if len(selected) != 2 or {record["model"] for record in selected} != {"stgt", "gat_lstm"}:
         raise ValueError("Select exactly one completed STGT ID and one completed GAT-LSTM ID")
+    compatibility_by_id = {}
     for record in selected:
-        if record["status"] != "completed" or record["git_commit"] != commit:
-            raise ValueError("Final test requires completed runs from this pushed code commit")
+        if record["status"] != "completed":
+            raise ValueError("Final test requires completed training runs")
+        compatibility_by_id[record["experiment_id"]] = (
+            validate_training_commit_compatibility(
+                root, record["git_commit"], commit
+            )
+        )
         if record["dataset_manifest"] != {"raw": raw, "processed": processed}:
             raise ValueError("Selected runs use different dataset versions")
         if scientific_configuration(record["configuration"]) != scientific_configuration(config):
@@ -266,7 +346,14 @@ def finalize_test(root, config_path, raw_dir, registry_path, experiment_ids, bra
     frozen_path = destination / "selection.json"
     if frozen_path.exists():
         frozen = json.loads(frozen_path.read_text())
-        if frozen["experiment_ids"] != ids or frozen["git_commit"] != commit:
+        expected_training_commits = {
+            record["experiment_id"]: record["git_commit"] for record in selected
+        }
+        if (
+            frozen["experiment_ids"] != ids
+            or frozen["git_commit"] != commit
+            or frozen.get("training_commits") != expected_training_commits
+        ):
             raise RuntimeError("Test selection is already frozen; do not retune against the test set")
         if (destination / "complete.json").exists():
             manifest = json.loads((destination / "complete.json").read_text())
@@ -276,7 +363,15 @@ def finalize_test(root, config_path, raw_dir, registry_path, experiment_ids, bra
             return destination
         raise RecoveryRequired(f"Incomplete final evaluation at {destination}; inspect failure. No training is repeated.")
     destination.mkdir(parents=True, exist_ok=False)
-    write_json(frozen_path, {"experiment_ids": ids, "git_commit": commit, "dataset_manifest": {"raw": raw, "processed": processed}})
+    write_json(frozen_path, {
+        "experiment_ids": ids,
+        "git_commit": commit,
+        "training_commits": {
+            record["experiment_id"]: record["git_commit"] for record in selected
+        },
+        "compatibility": compatibility_by_id,
+        "dataset_manifest": {"raw": raw, "processed": processed},
+    })
     frozen_config = copy.deepcopy(config)
     frozen_config["outputs"]["metrics_dir"] = str(destination / "metrics")
     frozen_config["outputs"]["predictions_dir"] = str(destination / "predictions")
