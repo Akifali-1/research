@@ -1,0 +1,55 @@
+seed: 42
+deterministic: true
+
+experiment:
+  max_gpu_runs: 10
+  max_retries_per_signature: 2
+  registry_path: results/experiment_registry.json
+  require_pushed_commit: true
+  require_drive_authorization: true
+  require_archive_validation: true
+  allow_execution: false
+
+data:
+  processed_dir: data/processed
+  scaler: standard
+  train_ratio: 0.70
+  validation_ratio: 0.15
+  lookback: 14
+  horizon: 1
+  undirected_graph: true
+  use_residual_baseline: false
+
+training:
+  batch_size: 4
+  epochs: 100
+  patience: 15
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  loss: huber
+  huber_delta: 1.0
+  scheduler_factor: 0.5
+  scheduler_patience: 8
+
+models:
+  stgt:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  gat_lstm:
+    gat_hidden: 48
+    gat_heads: 3
+    lstm_hidden: 64
+    lstm_layers: 3
+    gat_layers: 2
+    dropout: 0.25
+    input_noise: 0.0
+
+outputs:
+  checkpoint_dir: results/checkpoints
+  metrics_dir: results/metrics
+  predictions_dir: results/predictions
+  logs_dir: results/logs
+  drive_artifact_root: results

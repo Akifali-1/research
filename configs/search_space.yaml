@@ -1,0 +1,16 @@
+# Candidate changes are validation-selected only. The initial workflow should
+# run the two configured baseline candidates before any search candidate.
+budget:
+  max_gpu_runs: 10
+  max_retries_per_signature: 2
+  one_active_run: true
+
+search:
+  enabled: false
+  candidates: []
+
+# Example future candidate (disabled until baseline evidence exists):
+# - name: stgt_lookback_28
+#   model: stgt
+#   overrides:
+#     data.lookback: 28

@@ -1,0 +1,10 @@
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.2
+PyYAML>=6.0
+torch>=2.1
+torch-geometric>=2.4
+matplotlib>=3.7
+seaborn>=0.12
+py7zr>=0.20
+pytest>=7.4

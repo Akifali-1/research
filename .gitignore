@@ -1,0 +1,36 @@
+# Python and notebooks
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Large raw and generated data; keep directory markers only
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Experiment outputs and checkpoints
+results/checkpoints/
+results/experiment_registry.json
+results/experiment_registry.json.lock
+results/predictions/*
+results/metrics/*
+results/logs/*
+!results/**/.gitkeep
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.joblib
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db
