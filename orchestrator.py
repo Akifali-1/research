@@ -24,6 +24,7 @@ import yaml
 
 from src.experiment_registry import BudgetExceeded, RecoveryRequired, Registry, experiment_signature
 from src.raw_data import dataset_layout_error, source_paths
+from src.process_runner import run_logged
 
 EXPECTED_ARCHIVES = {
     f"{name}.csv.7z" for name in ("train", "items", "stores", "transactions", "oil",
@@ -375,9 +376,7 @@ def run_sequential(*, project_root, config_path, raw_dir, registry_path, models,
             log_path = artifact / "training.log"
             registry.update(experiment_id, "running", command=command, runtime=info, config_path=str(attempt_config))
             print(f"Running {experiment_id}; budget={registry.status()['submitted_runs']}/{registry.status()['max_runs']}; log={log_path}", flush=True)
-            with log_path.open("w", encoding="utf-8") as log:
-                result = subprocess.run(command, cwd=project_root, stdout=log, stderr=subprocess.STDOUT,
-                                        timeout=run_limit, check=False)
+            result = run_logged(command, cwd=project_root, log_path=log_path, timeout=run_limit)
             if result.returncode:
                 raise RuntimeError(f"Training exited {result.returncode}; see {log_path}")
             relative_files = ["config.yaml", "runtime.json", "dataset_manifest.json", "training.log",

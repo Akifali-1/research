@@ -208,6 +208,15 @@ all users/runtimes are inactive before manually resolving it. One authorized
 Colab session should control this registry; Drive does not provide a tested
 multi-machine distributed locking service here.
 
+## Live training logs
+
+Training stdout/stderr is streamed live to the Colab cell and saved to the
+attempt's `training.log`. Logs include experiment/device/window counts,
+batch progress, epoch train/validation loss, best loss, patience, learning rate,
+elapsed time, and checkpoint location. A silent/hung child still respects the
+configured timeout. This applies to newly launched processes; an already
+running process from an older commit retains its original logging behavior.
+
 ## Notebook stages
 
 Open `notebooks/colab_experiment.ipynb` from branch `research/initial-pipeline`.

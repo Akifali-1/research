@@ -259,6 +259,10 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path, res
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    print(f"Training {model_name} on {device}: nodes={data.num_nodes}, steps={data.num_steps}, "
+          f"train_windows={len(data.datasets['train'])}, val_windows={len(data.datasets['validation'])}, "
+          f"epochs={epochs}, batch_size={training_config['batch_size']}", flush=True)
+
     for epoch in range(start_epoch, epochs + 1):
         if wait >= patience:
             break
@@ -266,7 +270,8 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path, res
         model.train()
         running_loss = 0.0
         sample_count = 0
-        for batch in loaders["train"]:
+        epoch_started = time.perf_counter()
+        for step, batch in enumerate(loaders["train"], start=1):
             check_time()
             batch = {key: value.to(device) for key, value in batch.items()}
             optimizer.zero_grad(set_to_none=True)
@@ -280,6 +285,9 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path, res
             count = batch["x"].shape[0]
             running_loss += float(loss.detach().cpu()) * count
             sample_count += count
+            if step == 1 or step % 25 == 0 or step == len(loaders["train"]):
+                print(f"[{model_name}] Epoch {epoch}/{epochs} | batch {step}/{len(loaders['train'])} "
+                      f"| mean_train_loss={running_loss / sample_count:.6f}", flush=True)
         train_loss = running_loss / sample_count
 
         model.eval()
@@ -321,7 +329,10 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path, res
         }
         atomic_torch_save(latest, latest_path)
         save_json({"history": history}, logs_dir / "history.json")
-        print(f"Epoch {epoch}: train={train_loss:.6f}, val={validation_loss:.6f}", flush=True)
+        print(f"[{model_name}] Epoch {epoch}/{epochs} complete | train={train_loss:.6f} "
+              f"| val={validation_loss:.6f} | best_val={best_validation:.6f} "
+              f"| patience={wait}/{patience} | lr={optimizer.param_groups[0]['lr']:.2g} "
+              f"| elapsed={time.perf_counter() - epoch_started:.1f}s | checkpoint={latest_path}", flush=True)
     if best_state is None:
         raise RuntimeError("No checkpoint was selected")
     model.load_state_dict(best_state)
