@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from metrics import forecasting_metrics  # noqa: E402
-from preprocessing import validate_outputs  # noqa: E402
+from preprocessing import preprocess, validate_outputs  # noqa: E402
 
 
 def test_synthetic_processed_files_validate(tmp_path):
@@ -51,6 +51,24 @@ def test_synthetic_processed_files_validate(tmp_path):
     assert node_type_ids(nodes).tolist() == [0, 1, 2, 3]
 
 
+def test_chunked_preprocessing_uses_tiny_csvs_only(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    pd.DataFrame({"item_nbr": [1, 2], "family": ["FOOD", "DRINK"]}).to_csv(raw / "items.csv", index=False)
+    pd.DataFrame({"store_nbr": [1], "state": ["A"], "city": ["X"]}).to_csv(raw / "stores.csv", index=False)
+    pd.DataFrame({"id": [1, 2, 3, 4], "date": ["2020-01-01", "2020-01-01", "2020-01-02", "2020-01-02"],
+                  "store_nbr": [1, 1, 1, 1], "item_nbr": [1, 2, 1, 2], "unit_sales": [10, 5, -1, 2]}).to_csv(raw / "train.csv", index=False)
+    output = tmp_path / "processed"
+    report = preprocess(raw, output, "2020-01-01", "2020-01-04", chunksize=1)
+    sales = pd.read_csv(output / "sales.csv")
+    assert len(sales) == 2  # no manufactured future zero labels
+    assert sales["STORE__0001"].tolist() == [15.0, 2.0]
+    assert sales["FAMILY__FOOD"].tolist() == [10.0, 0.0]
+    assert report["negative_sales_clipped"] == 1
+    assert report["edge_count"] == 4
+    validate_outputs(output)
+
+
 def test_window_shapes_and_chronological_ranges():
     pytest.importorskip("torch")
     from dataset import GraphWindowDataset, collate_graph_windows
@@ -65,6 +83,9 @@ def test_window_shapes_and_chronological_ranges():
     batch = collate_graph_windows([dataset[0], dataset[1]])
     assert tuple(batch["x"].shape) == (2, 4, 5, 1)
     assert tuple(batch["y"].shape) == (2, 4, 3)
+    assert ranges["train"][1] - 1 + 3 <= ranges["train_end"][0]
+    assert ranges["validation"][1] - 1 + 3 <= ranges["validation_end"][0]
+    assert ranges["test"][0] == ranges["validation_end"][0]
 
 
 def test_metrics_zero_policy_is_explicit():
@@ -96,5 +117,33 @@ def test_model_forward_shapes():
     stgt.eval()
     gat_lstm.eval()
     with torch.no_grad():
-        assert tuple(stgt(x, edges, node_types).shape) == (2, 4, 3)
-        assert tuple(gat_lstm(x, edges).shape) == (2, 4, 3)
+        prediction = stgt(x, edges, node_types)
+        assert tuple(prediction.shape) == (2, 4, 3)
+        assert torch.isfinite(torch.nn.functional.huber_loss(prediction, torch.zeros_like(prediction)))
+        separate = torch.cat([stgt(x[i:i+1], edges, node_types) for i in range(2)])
+        assert torch.allclose(prediction, separate, atol=1e-5)
+        gat_prediction = gat_lstm(x, edges)
+        assert tuple(gat_prediction.shape) == (2, 4, 3)
+        separate = torch.cat([gat_lstm(x[i:i+1], edges) for i in range(2)])
+        assert torch.allclose(gat_prediction, separate, atol=1e-5)
+
+
+def test_atomic_checkpoint_and_rng_round_trip(tmp_path):
+    torch = pytest.importorskip("torch")
+    from checkpointing import atomic_torch_save, capture_rng_state, restore_rng_state
+    state = capture_rng_state()
+    expected = torch.rand(3)
+    atomic_torch_save({"epoch": 2, "rng_state": state, "tensor": expected}, tmp_path / "latest.pt")
+    saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+    restore_rng_state(saved["rng_state"])
+    assert torch.equal(torch.rand(3), expected)
+    assert saved["epoch"] == 2
+
+
+def test_scaler_uses_training_prefix_only():
+    pytest.importorskip("torch")
+    from utils import fit_scale_matrix
+    series = np.array([[1., 3., 1000., 2000.]])
+    _, state = fit_scale_matrix(series, train_end=2)
+    assert state["center"] == [2.0]
+    assert state["scale"] == [1.0]

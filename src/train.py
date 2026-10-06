@@ -7,8 +7,6 @@ Colab. Importing the module does not load data or start computation.
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -244,6 +242,10 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path, res
         prior_seconds = float(saved["training_seconds"])
         restore_rng_state(saved["rng_state"])
         atomic_torch_save({**metadata, "state_dict": best_state}, best_path)
+        # A retry finishing after the last epoch still needs its own durable
+        # latest checkpoint and history, rather than pointing only at an old attempt.
+        atomic_torch_save({**saved, **metadata}, latest_path)
+        save_json({"history": history}, logs_dir / "history.json")
         print(f"Resuming after committed epoch {saved['epoch']}; this retry consumes another budget slot", flush=True)
     start_time = time.perf_counter()
     runtime_limit = float(config["experiment"]["max_job_seconds"])

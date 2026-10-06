@@ -106,6 +106,15 @@ def runtime_info():
     return result
 
 
+def quality_gate(root):
+    """Run synthetic CPU checks; failures occur before a budget slot is reserved."""
+    for package in ("torch", "torch_geometric", "numpy", "pandas", "sklearn", "yaml", "pytest"):
+        if importlib.util.find_spec(package) is None:
+            raise RuntimeError(f"Missing required quality-gate dependency: {package}")
+    subprocess.run([sys.executable, "-m", "compileall", "-q", str(root / "src"), str(root / "tests")], check=True)
+    subprocess.run([sys.executable, "-m", "pytest", "-q", "tests"], cwd=root, check=True, timeout=180)
+
+
 def file_manifest(directory, names):
     entries = []
     for name in sorted(names):
@@ -184,10 +193,11 @@ def prepare_data(root, config_path, raw_dir, processed_base, branch=None):
     info = runtime_info()
     destination.mkdir(parents=True)
     write_json(destination / "preprocessing_state.json", {"status": "running", "git_commit": commit,
-                                                         "configuration": config["preprocessing"], "raw_manifest": raw})
+                                                         "configuration": config["preprocessing"], "raw_manifest": raw,
+                                                         "runtime": info})
     prep = config["preprocessing"]
     command = [sys.executable, str(root / "src/preprocessing.py"), "--raw-dir", str(raw_dir),
-               "--processed-dir", str(destination),
+               "--processed-dir", str(destination), "--cache-dir", "/content/favorita-csv-cache",
                "--start-date", str(prep["start_date"]), "--end-date", str(prep["end_date"]),
                "--chunksize", str(prep["chunksize"]), "--missing-policy", prep["missing_policy"]]
     try:
@@ -212,8 +222,70 @@ def validate_budget(registry):
     return status
 
 
+def finalize_test(root, config_path, raw_dir, registry_path, experiment_ids, branch=None):
+    """Freeze validation-selected IDs before accessing test data; never retrain."""
+    config = load_config(config_path)
+    artifacts = Path(config["outputs"]["drive_artifact_root"])
+    require_colab_drive(raw_dir, registry_path, artifacts, config["data"]["processed_dir"])
+    commit = validate_pushed_repository(root, branch)
+    raw = validate_archives(raw_dir)
+    processed = verify_processed(config["data"]["processed_dir"], raw)
+    registry = Registry(registry_path, max_runs=int(config["experiment"]["max_gpu_runs"]))
+    validate_budget(registry)
+    state = registry.snapshot()
+    selected = [record for record in state["experiments"] if record["experiment_id"] in set(experiment_ids)]
+    if len(selected) != 2 or {record["model"] for record in selected} != {"stgt", "gat_lstm"}:
+        raise ValueError("Select exactly one completed STGT ID and one completed GAT-LSTM ID")
+    for record in selected:
+        if record["status"] != "completed" or record["git_commit"] != commit:
+            raise ValueError("Final test requires completed runs from this pushed code commit")
+        if record["dataset_manifest"] != {"raw": raw, "processed": processed}:
+            raise ValueError("Selected runs use different dataset versions")
+        if scientific_configuration(record["configuration"]) != scientific_configuration(config):
+            raise ValueError("Selected runs/configurations differ from the shared comparison protocol")
+        validate_completed_artifacts(record)
+    destination = artifacts / "final_test"
+    ids = sorted(experiment_ids)
+    frozen_path = destination / "selection.json"
+    if frozen_path.exists():
+        frozen = json.loads(frozen_path.read_text())
+        if frozen["experiment_ids"] != ids or frozen["git_commit"] != commit:
+            raise RuntimeError("Test selection is already frozen; do not retune against the test set")
+        if (destination / "complete.json").exists():
+            manifest = json.loads((destination / "complete.json").read_text())
+            if file_manifest(destination, [item["name"] for item in manifest["files"]]) != manifest:
+                raise ValueError("Final-test artifacts changed or are missing")
+            print(f"Verified existing final-test report: {destination / 'metrics/model_comparison.csv'}")
+            return destination
+        raise RecoveryRequired(f"Incomplete final evaluation at {destination}; inspect failure. No training is repeated.")
+    destination.mkdir(parents=True, exist_ok=False)
+    write_json(frozen_path, {"experiment_ids": ids, "git_commit": commit, "dataset_manifest": {"raw": raw, "processed": processed}})
+    frozen_config = copy.deepcopy(config)
+    frozen_config["outputs"]["metrics_dir"] = str(destination / "metrics")
+    frozen_config["outputs"]["predictions_dir"] = str(destination / "predictions")
+    frozen_config["final_evaluation"] = {"selection_frozen": True, "experiment_ids": ids}
+    final_config = destination / "config.yaml"
+    final_config.write_text(yaml.safe_dump(frozen_config, sort_keys=False))
+    checkpoint_paths = {record["model"]: Path(record["artifact_dir"]) / "checkpoints/best.pt" for record in selected}
+    command = [sys.executable, "-u", str(root / "src/evaluate.py"), "--project-root", str(root), "--config", str(final_config),
+               "--stgt-checkpoint", str(checkpoint_paths["stgt"]), "--gat-lstm-checkpoint", str(checkpoint_paths["gat_lstm"])]
+    try:
+        with (destination / "evaluation.log").open("w") as log:
+            subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True,
+                           timeout=int(config["experiment"]["max_job_seconds"]))
+        manifest = file_manifest(destination, [str(path.relative_to(destination)) for path in destination.rglob("*")
+                                               if path.is_file() and path.name not in {"complete.json", "status.json"}])
+        write_json(destination / "complete.json", manifest)
+        write_json(destination / "status.json", {"status": "completed"})
+        print(f"Test report: {destination / 'metrics/model_comparison.csv'}")
+        return destination
+    except BaseException as exc:
+        write_json(destination / "status.json", {"status": "failed", "failure": str(exc)})
+        raise
+
+
 def run_sequential(*, project_root, config_path, raw_dir, registry_path, models,
-                   max_runs=10, allow_execution=False, force_retry=False, branch=None):
+                   max_runs=10, allow_execution=False, force_retry=False, restart_without_checkpoint=False, branch=None):
     if not allow_execution:
         raise RuntimeError("Execution is disabled; authorize notebook gates first")
     config = load_config(config_path)
@@ -227,6 +299,7 @@ def run_sequential(*, project_root, config_path, raw_dir, registry_path, models,
     info = runtime_info()
     if not info["cuda_available"]:
         raise RuntimeError("Select a GPU runtime in Colab; no training run reserved")
+    quality_gate(project_root)
     registry = Registry(registry_path, max_runs=min(max_runs, int(config["experiment"]["max_gpu_runs"])),
                         max_retries=int(config["experiment"]["max_retries_per_signature"]))
     validate_budget(registry)
@@ -242,6 +315,17 @@ def run_sequential(*, project_root, config_path, raw_dir, registry_path, models,
             reports.append({"model": model, "action": "skip_completed", "record": completed[-1]})
             print(f"Skipped completed run: {completed[-1]['experiment_id']}", flush=True)
             continue
+        if (artifacts / "final_test/selection.json").exists():
+            raise RuntimeError("Test selection is frozen; no further training/search is permitted in this campaign")
+        # Rejected recovery is checked before consuming a submission slot.
+        if matches:
+            if not force_retry:
+                raise RecoveryRequired("Prior attempt requires explicit RETRY authorization")
+            if matches[-1].get("runtime", {}).get("packages") not in (None, info["packages"]):
+                raise RecoveryRequired("Package versions differ from the interrupted run. Reinstall its recorded versions before resume.")
+            latest = Path(matches[-1]["artifact_dir"]) / "checkpoints/latest.pt"
+            if not latest.exists() and not restart_without_checkpoint:
+                raise RecoveryRequired("No committed epoch checkpoint. Inspect the log and use --force-retry --restart-without-checkpoint for an explicit counted restart.")
         remaining_seconds = int(deadline_seconds - time.time())
         if remaining_seconds <= 0:
             raise BudgetExceeded("Campaign deadline reached; checkpoints and logs remain on Drive")
@@ -267,9 +351,11 @@ def run_sequential(*, project_root, config_path, raw_dir, registry_path, models,
                        "--config", str(attempt_config), "--project-root", str(project_root)]
             if matches:
                 latest = Path(matches[-1]["artifact_dir"]) / "checkpoints/latest.pt"
-                if not latest.exists():
-                    raise RecoveryRequired("Retry has no committed epoch checkpoint. Inspect failure; explicitly change configuration for a fresh run.")
-                command.extend(["--resume", str(latest)])
+                if latest.exists():
+                    command.extend(["--resume", str(latest)])
+                else:
+                    registry.update(experiment_id, "reserved", restart_reason="explicit restart authorized; no epoch checkpoint exists")
+                    print(f"Explicit counted restart from epoch 1: {experiment_id}", flush=True)
             log_path = artifact / "training.log"
             registry.update(experiment_id, "running", command=command, runtime=info, config_path=str(attempt_config))
             print(f"Running {experiment_id}; budget={registry.status()['submitted_runs']}/{registry.status()['max_runs']}; log={log_path}", flush=True)
@@ -306,9 +392,12 @@ def build_parser():
     parser.add_argument("--max-runs", type=int, default=10)
     parser.add_argument("--allow-execution", action="store_true")
     parser.add_argument("--force-retry", action="store_true")
+    parser.add_argument("--restart-without-checkpoint", action="store_true")
     parser.add_argument("--branch")
     parser.add_argument("--status-only", action="store_true")
     parser.add_argument("--recover-interrupted", action="store_true")
+    parser.add_argument("--finalize-test", action="store_true")
+    parser.add_argument("--experiment-ids", nargs=2)
     return parser
 
 
@@ -323,10 +412,17 @@ if __name__ == "__main__":
         if confirm != "RECOVER":
             raise SystemExit("Recovery not confirmed")
         print(registry.mark_interrupted_active("user-confirmed inactive previous session"))
+    elif args.finalize_test:
+        if not args.allow_execution or not args.experiment_ids or args.raw_dir is None:
+            raise SystemExit("Final-test gate requires --allow-execution, --experiment-ids, and --raw-dir")
+        finalize_test(root, args.config.resolve(), args.raw_dir, args.registry, args.experiment_ids, args.branch)
     else:
         if args.raw_dir is None:
             raise SystemExit("--raw-dir is required for execution")
+        if args.restart_without_checkpoint and not args.force_retry:
+            raise SystemExit("--restart-without-checkpoint requires --force-retry")
         print(json.dumps(run_sequential(project_root=root, config_path=args.config.resolve(), raw_dir=args.raw_dir,
                                        registry_path=args.registry, models=args.models, max_runs=args.max_runs,
                                        allow_execution=args.allow_execution, force_retry=args.force_retry,
+                                       restart_without_checkpoint=args.restart_without_checkpoint,
                                        branch=args.branch), indent=2, default=str))
