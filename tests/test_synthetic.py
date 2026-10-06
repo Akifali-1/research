@@ -69,6 +69,22 @@ def test_chunked_preprocessing_uses_tiny_csvs_only(tmp_path):
     validate_outputs(output)
 
 
+def test_raw_validator_accepts_csvs_and_checks_train_schema(tmp_path):
+    from orchestrator import validate_archives
+    from src.raw_data import SOURCE_STEMS
+    for stem in SOURCE_STEMS:
+        (tmp_path / f"{stem}.csv").write_text("fixture\n")
+    (tmp_path / "items.csv").write_text("item_nbr,family,class,perishable\n1,FOOD,1,0\n")
+    (tmp_path / "stores.csv").write_text("store_nbr,city,state,type,cluster\n1,X,A,D,1\n")
+    (tmp_path / "train.csv").write_text("id,date,store_nbr,item_nbr,unit_sales\n1,2020-01-01,1,1,5\n")
+    manifest = validate_archives(tmp_path)
+    assert len(manifest["files"]) == 8
+    assert all(entry["name"].endswith(".csv") for entry in manifest["files"])
+    (tmp_path / "train.csv").write_text("wrong,headers\n")
+    with pytest.raises(ValueError, match="train.csv"):
+        validate_archives(tmp_path)
+
+
 def test_window_shapes_and_chronological_ranges():
     pytest.importorskip("torch")
     from dataset import GraphWindowDataset, collate_graph_windows

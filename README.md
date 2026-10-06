@@ -49,7 +49,18 @@ Forecasting**: items contain `item_nbr,family,class,perishable`; stores contain
 CSV has not been locally expanded. Preserve all eight archives, including
 metadata/covariate files unused by the initial comparison. Nothing is deleted.
 
-Upload those eight archives from `data/raw/` to:
+Upload either those eight archives, eight extracted CSVs, or the original
+`favorita-grocery-sales-forecasting.zip` to the Drive raw folder below. The
+preflight recognizes a single nested source folder, accepts mixed CSV/7z
+layouts, and can unpack the **outer ZIP only**, leaving the large train 7z
+compressed. Original ZIP/source files are preserved. If the ZIP is elsewhere
+in Drive, set `SOURCE_ZIP` in the notebook to its exact path.
+
+Files absent from Drive cannot be recovered from local Windows paths in Colab.
+For missing-source errors, inspect the printed raw-folder listing, correct
+`RAW_DIR`, or upload the ZIP; do not fabricate an empty missing source.
+
+Drive layout:
 
 ```text
 MyDrive/supply_chain_research/
@@ -69,8 +80,10 @@ MyDrive/supply_chain_research/
     └── final_test/                # frozen selection, test predictions/report
 ```
 
-The Colab preflight hashes the archives, checks inner member names/sizes, and
-extracts only small metadata to verify schemas. This is **not** a claim of a
+The Colab preflight hashes the selected CSV or 7z sources, checks inner member names/sizes, and
+extracts only small compressed metadata to verify schemas. Direct CSV schemas
+are inspected from their headers. When both representations exist, 7z is the
+consistent preference of preflight and preprocessing. This is **not** a claim of a
 full CRC scan of the large train archive. Its full extraction in Colab checks
 integrity before a processed completion marker can exist or training can start.
 

@@ -23,6 +23,7 @@ from pathlib import Path
 import yaml
 
 from src.experiment_registry import BudgetExceeded, RecoveryRequired, Registry, experiment_signature
+from src.raw_data import dataset_layout_error, source_paths
 
 EXPECTED_ARCHIVES = {
     f"{name}.csv.7z" for name in ("train", "items", "stores", "transactions", "oil",
@@ -127,26 +128,41 @@ def file_manifest(directory, names):
 
 def validate_archives(raw_dir):
     import py7zr
-    manifest = file_manifest(raw_dir, EXPECTED_ARCHIVES)
+    sources, missing = source_paths(raw_dir)
+    if missing:
+        raise dataset_layout_error(raw_dir, missing)
+    manifest = file_manifest(raw_dir, [path.name for path in sources.values()])
     manifest["dataset"] = "Corporación Favorita Grocery Sales Forecasting"
     for entry in manifest["files"]:
-        with py7zr.SevenZipFile(Path(raw_dir) / entry["name"], "r") as archive:
-            members = archive.list()
-            if len(members) != 1 or members[0].filename != entry["name"][:-3]:
-                raise ValueError(f"Unexpected archive members: {entry['name']}")
-            entry["uncompressed_bytes"] = members[0].uncompressed
+        if entry["name"].endswith(".7z"):
+            with py7zr.SevenZipFile(Path(raw_dir) / entry["name"], "r") as archive:
+                members = archive.list()
+                if len(members) != 1 or members[0].filename != entry["name"][:-3]:
+                    raise ValueError(f"Unexpected archive members: {entry['name']}")
+                entry["uncompressed_bytes"] = members[0].uncompressed
+        else:
+            entry["uncompressed_bytes"] = entry["bytes"]
     # Validate small metadata schemas without expanding the train archive.
     import tempfile
     import csv
     with tempfile.TemporaryDirectory(prefix="favorita-schema-") as folder:
         for stem, required in (("items", {"item_nbr", "family", "class", "perishable"}),
                                ("stores", {"store_nbr", "city", "state", "type", "cluster"})):
-            with py7zr.SevenZipFile(Path(raw_dir) / f"{stem}.csv.7z", "r") as archive:
-                archive.extractall(path=folder)
-            with (Path(folder) / f"{stem}.csv").open(encoding="utf-8-sig", newline="") as handle:
+            csv_path = sources[stem]
+            if csv_path.name.endswith(".7z"):
+                with py7zr.SevenZipFile(csv_path, "r") as archive:
+                    archive.extractall(path=folder)
+                csv_path = Path(folder) / f"{stem}.csv"
+            with csv_path.open(encoding="utf-8-sig", newline="") as handle:
                 columns = next(csv.reader(handle))
             if not required.issubset(columns):
                 raise ValueError(f"{stem}.csv is not the expected Favorita schema")
+    # Direct CSV input allows train-header verification without extraction.
+    if sources["train"].suffix == ".csv":
+        with sources["train"].open(encoding="utf-8-sig", newline="") as handle:
+            columns = next(csv.reader(handle))
+        if not {"id", "date", "store_nbr", "item_nbr", "unit_sales"}.issubset(columns):
+            raise ValueError("train.csv is not the expected Favorita schema")
     return manifest
 
 

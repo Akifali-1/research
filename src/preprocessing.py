@@ -27,11 +27,12 @@ def slug(value):
 def materialize_csv(raw_dir, filename, cache_dir=None):
     raw_dir = Path(raw_dir)
     original = raw_dir / filename
-    if original.is_file():
+    archive_path = raw_dir / f"{filename}.7z"
+    # Match preflight's source preference when CSV and 7z are both present.
+    if original.is_file() and not archive_path.is_file():
         return original
     cache = Path(cache_dir) if cache_dir else raw_dir
     extracted = cache / filename
-    archive_path = raw_dir / f"{filename}.7z"
     if not archive_path.is_file():
         raise FileNotFoundError(archive_path)
     import py7zr
