@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Tuple
@@ -40,6 +41,7 @@ def save_json(payload: Mapping[str, Any], path: Path | str) -> None:
 
 def set_seed(seed: int, deterministic: bool = True) -> None:
     """Set all practical random seeds without claiming perfect GPU determinism."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -48,6 +50,7 @@ def set_seed(seed: int, deterministic: bool = True) -> None:
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def model_parameter_count(model: torch.nn.Module) -> int:
@@ -72,6 +75,10 @@ def read_processed_data(data_dir: Path | str) -> Tuple[pd.DataFrame, pd.DataFram
         raise ValueError("sales.csv contains duplicate dates")
     if not sales["Date"].is_monotonic_increasing:
         raise ValueError("sales.csv must be sorted in chronological order")
+    if sales["Date"].isna().any():
+        raise ValueError("sales.csv has invalid dates")
+    if not sales["Date"].diff().dropna().eq(pd.Timedelta(days=1)).all():
+        raise ValueError("sales.csv must have a continuous daily timeline")
 
     node_ids = nodes["node_id"].astype(str).tolist()
     if len(node_ids) != len(set(node_ids)):
@@ -82,6 +89,9 @@ def read_processed_data(data_dir: Path | str) -> Tuple[pd.DataFrame, pd.DataFram
     unknown_sales = sorted(set(sales.columns) - {"Date", *node_ids})
     if unknown_sales:
         raise ValueError(f"sales.csv contains columns not present in nodes.csv: {unknown_sales[:10]}")
+    values = sales[node_ids].to_numpy(dtype=np.float64)
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError("Processed demand must be finite and nonnegative")
     known = set(node_ids)
     if not set(edges["source"].astype(str)).issubset(known):
         raise ValueError("edges.csv contains an unknown source node")
@@ -145,6 +155,8 @@ def split_target_ranges(
     validation_ratio: float = 0.15,
 ) -> Dict[str, Tuple[int, int]]:
     """Return target-index ranges with historical context crossing split boundaries."""
+    if lookback < 1 or horizon < 1:
+        raise ValueError("lookback and horizon must be positive")
     if train_ratio <= 0 or validation_ratio <= 0 or train_ratio + validation_ratio >= 1:
         raise ValueError("Train and validation ratios must be positive and leave test data")
     train_end = int(num_steps * train_ratio)

@@ -23,19 +23,21 @@ def forecasting_metrics(y_true: np.ndarray, y_pred: np.ndarray, zero_threshold: 
     pred = np.maximum(_flatten(y_pred), 0.0)
     if true.shape != pred.shape or true.size == 0:
         raise ValueError("y_true and y_pred must have the same non-empty shape")
+    if not np.isfinite(true).all() or not np.isfinite(pred).all():
+        raise ValueError("Missing/nonfinite targets or predictions are not valid metric inputs")
     absolute_error = np.abs(true - pred)
     denominator = np.abs(true) + np.abs(pred)
     mask = np.abs(true) > zero_threshold
     wape_denominator = np.sum(np.abs(true))
-    r2 = float(r2_score(true, pred)) if np.unique(true).size > 1 else 0.0
+    r2 = float(r2_score(true, pred)) if np.unique(true).size > 1 else float("nan")
     return {
         "MAE": float(mean_absolute_error(true, pred)),
         "MSE": float(mean_squared_error(true, pred)),
         "RMSE": float(np.sqrt(mean_squared_error(true, pred))),
-        "WAPE": float(np.sum(absolute_error) / wape_denominator) if wape_denominator > 0 else 0.0,
+        "WAPE": float(np.sum(absolute_error) / wape_denominator) if wape_denominator > 0 else float("nan"),
         "sMAPE": float(np.mean(2.0 * absolute_error / np.maximum(denominator, 1e-8))),
         "R2": r2,
-        "MAPE_masked": float(np.mean(absolute_error[mask] / np.abs(true[mask]))) if np.any(mask) else 0.0,
+        "MAPE_masked": float(np.mean(absolute_error[mask] / np.abs(true[mask]))) if np.any(mask) else float("nan"),
         "MAPE_valid_fraction": float(np.mean(mask)),
     }
 

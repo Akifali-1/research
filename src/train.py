@@ -7,7 +7,8 @@ Colab. Importing the module does not load data or start computation.
 from __future__ import annotations
 
 import argparse
-import copy
+import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -34,6 +35,7 @@ from utils import (
     set_seed,
     split_target_ranges,
 )
+from checkpointing import atomic_torch_save, capture_rng_state, restore_rng_state
 
 
 class ExperimentData:
@@ -73,7 +75,6 @@ class ExperimentData:
             alpha = float(data_config.get("baseline_alpha", 2.0 / 8.0))
             for step in range(1, self.num_steps):
                 baseline[:, step] = alpha * raw_series[:, step - 1] + (1 - alpha) * baseline[:, step - 1]
-            _, baseline_state = fit_scale_matrix(baseline, self.train_end, str(data_config.get("scaler", "standard")))
             # Use the demand scaler so residuals and predictions invert consistently.
             center = np.asarray(self.scaler_state["center"]).reshape(-1, 1)
             scale = np.asarray(self.scaler_state["scale"]).reshape(-1, 1)
@@ -140,12 +141,23 @@ def evaluate_loader(
     model.eval()
     true_batches = []
     prediction_batches = []
+    target_indices = []
+    edge_index = data.edge_index.to(device)
+    types = data.node_type_ids.to(device)
+    inference_seconds = 0.0
     for batch in loader:
         batch = {key: value.to(device) for key, value in batch.items()}
-        prediction = _call_model(model_name, model, batch, data.edge_index.to(device), data.node_type_ids.to(device))
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        started = time.perf_counter()
+        prediction = _call_model(model_name, model, batch, edge_index, types)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        inference_seconds += time.perf_counter() - started
         true_np, prediction_np = _absolute_arrays(prediction, batch["y"], batch, data.scaler_state)
         true_batches.append(true_np)
         prediction_batches.append(prediction_np)
+        target_indices.extend(batch["target_index"].cpu().tolist())
     if not true_batches:
         raise RuntimeError("Evaluation loader is empty")
     y_true = np.concatenate(true_batches, axis=0)
@@ -156,10 +168,19 @@ def evaluate_loader(
         "by_node_type": metrics_by_node_type(y_true, y_pred, data.node_type_ids.numpy()),
         "y_true": y_true,
         "y_pred": y_pred,
+        "target_indices": np.asarray(target_indices, dtype=np.int64),
+        "inference_seconds": inference_seconds,
     }
 
 
-def train_model(model_name: str, config: Dict[str, Any], project_root: Path) -> Dict[str, Any]:
+def train_model(model_name: str, config: Dict[str, Any], project_root: Path, resume: Path | None = None) -> Dict[str, Any]:
+    """Validation-only training. Test evaluation is an explicit later stage.
+
+    Interrupted attempts recover from the last fully committed epoch. Any
+    partial epoch is replayed in an explicit, budget-counted retry.
+    """
+    if not config.get("run", {}).get("experiment_id"):
+        raise RuntimeError("Training must be launched by the budget controller with a registered run")
     set_seed(int(config["seed"]), bool(config.get("deterministic", True)))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = ExperimentData(config, project_root)
@@ -185,32 +206,94 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path) -> 
     best_state = None
     wait = 0
     history = []
+    start_epoch = 1
+    prior_seconds = 0.0
+    outputs = config["outputs"]
+    checkpoint_dir = project_root / outputs["checkpoint_dir"]
+    metrics_dir = project_root / outputs["metrics_dir"]
+    predictions_dir = project_root / outputs["predictions_dir"]
+    logs_dir = project_root / outputs["logs_dir"]
+    for directory in (checkpoint_dir, metrics_dir, predictions_dir, logs_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    latest_path = checkpoint_dir / "latest.pt"
+    best_path = checkpoint_dir / "best.pt"
+    run = config["run"]
+    metadata = {
+        "model_name": model_name,
+        "configuration": config,
+        "signature": run["signature"],
+        "node_names": data.node_names,
+        "node_type_ids": data.node_type_ids,
+        "edge_index": data.edge_index,
+        "scaler_state": data.scaler_state,
+        "split_ranges": data.ranges,
+        "dates": data.dates,
+    }
+    if resume is not None:
+        saved = torch.load(resume, map_location="cpu", weights_only=False)
+        if saved["signature"] != run["signature"] or saved["node_names"] != data.node_names:
+            raise ValueError("Resume checkpoint does not match code/config/dataset signature or node order")
+        model.load_state_dict(saved["state_dict"])
+        optimizer.load_state_dict(saved["optimizer"])
+        scheduler.load_state_dict(saved["scheduler"])
+        best_state = saved["best_state"]
+        best_validation = saved["best_validation_loss"]
+        wait = saved["wait"]
+        history = saved["history"]
+        start_epoch = int(saved["epoch"]) + 1
+        prior_seconds = float(saved["training_seconds"])
+        restore_rng_state(saved["rng_state"])
+        atomic_torch_save({**metadata, "state_dict": best_state}, best_path)
+        print(f"Resuming after committed epoch {saved['epoch']}; this retry consumes another budget slot", flush=True)
     start_time = time.perf_counter()
+    runtime_limit = float(config["experiment"]["max_job_seconds"])
+    edge_index = data.edge_index.to(device)
+    types = data.node_type_ids.to(device)
+
+    def check_time():
+        if time.perf_counter() - start_time >= runtime_limit:
+            raise TimeoutError("Training runtime limit reached; committed epoch checkpoints are preserved")
+
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
+        if wait >= patience:
+            break
+        check_time()
         model.train()
         running_loss = 0.0
+        sample_count = 0
         for batch in loaders["train"]:
+            check_time()
             batch = {key: value.to(device) for key, value in batch.items()}
             optimizer.zero_grad(set_to_none=True)
-            prediction = _call_model(model_name, model, batch, data.edge_index.to(device), data.node_type_ids.to(device))
+            prediction = _call_model(model_name, model, batch, edge_index, types)
             loss = F.huber_loss(prediction, batch["y"], delta=delta)
+            if not torch.isfinite(loss):
+                raise ValueError("Nonfinite training loss")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
             optimizer.step()
-            running_loss += float(loss.detach().cpu())
-        train_loss = running_loss / max(1, len(loaders["train"]))
+            count = batch["x"].shape[0]
+            running_loss += float(loss.detach().cpu()) * count
+            sample_count += count
+        train_loss = running_loss / sample_count
 
         model.eval()
         validation_loss = 0.0
+        validation_count = 0
         with torch.no_grad():
             for batch in loaders["validation"]:
+                check_time()
                 batch = {key: value.to(device) for key, value in batch.items()}
-                prediction = _call_model(model_name, model, batch, data.edge_index.to(device), data.node_type_ids.to(device))
-                validation_loss += float(F.huber_loss(prediction, batch["y"], delta=delta).cpu())
-        validation_loss /= max(1, len(loaders["validation"]))
+                prediction = _call_model(model_name, model, batch, edge_index, types)
+                count = batch["x"].shape[0]
+                validation_loss += float(F.huber_loss(prediction, batch["y"], delta=delta).cpu()) * count
+                validation_count += count
+        validation_loss /= validation_count
+        if not np.isfinite(validation_loss):
+            raise ValueError("Nonfinite validation loss")
         scheduler.step(validation_loss)
         history.append(
             {
@@ -223,42 +306,30 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path) -> 
         if validation_loss < best_validation:
             best_validation = validation_loss
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            atomic_torch_save({**metadata, "state_dict": best_state}, best_path)
             wait = 0
         else:
             wait += 1
-            if wait >= patience:
-                break
+        latest = {
+            **metadata, "state_dict": model.state_dict(), "epoch": epoch,
+            "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+            "best_state": best_state, "best_validation_loss": best_validation,
+            "wait": wait, "history": history, "rng_state": capture_rng_state(),
+            "training_seconds": prior_seconds + time.perf_counter() - start_time,
+        }
+        atomic_torch_save(latest, latest_path)
+        save_json({"history": history}, logs_dir / "history.json")
+        print(f"Epoch {epoch}: train={train_loss:.6f}, val={validation_loss:.6f}", flush=True)
     if best_state is None:
         raise RuntimeError("No checkpoint was selected")
     model.load_state_dict(best_state)
-    training_seconds = time.perf_counter() - start_time
-    evaluation_start = time.perf_counter()
-    evaluation = evaluate_loader(model_name, model, loaders["test"], data, device)
-    inference_seconds = time.perf_counter() - evaluation_start
+    training_seconds = prior_seconds + time.perf_counter() - start_time
+    evaluation = evaluate_loader(model_name, model, loaders["validation"], data, device)
+    inference_seconds = evaluation["inference_seconds"]
     peak_memory = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
 
-    outputs = config["outputs"]
-    checkpoint_dir = project_root / outputs["checkpoint_dir"]
-    metrics_dir = project_root / outputs["metrics_dir"]
-    predictions_dir = project_root / outputs["predictions_dir"]
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    predictions_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = {
-        "model_name": model_name,
-        "model_config": config["models"][model_name],
-        "data_config": config["data"],
-        "state_dict": best_state,
-        "node_names": data.node_names,
-        "node_type_ids": data.node_type_ids,
-        "edge_index": data.edge_index,
-        "scaler_state": data.scaler_state,
-        "split_ranges": data.ranges,
-        "history": history,
-    }
-    checkpoint_path = checkpoint_dir / f"{model_name}.pt"
-    torch.save(checkpoint, checkpoint_path)
-    np.savez_compressed(predictions_dir / f"{model_name}_test.npz", y_true=evaluation["y_true"], y_pred=evaluation["y_pred"])
+    np.savez_compressed(predictions_dir / "validation.npz", y_true=evaluation["y_true"], y_pred=evaluation["y_pred"],
+                        target_indices=evaluation["target_indices"], node_names=data.node_names, dates=data.dates)
     report = {
         "model": model_name,
         "device": str(device),
@@ -268,13 +339,16 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path) -> 
         "peak_gpu_memory_bytes": int(peak_memory),
         "epochs_completed": len(history),
         "best_validation_loss": best_validation,
-        "test": evaluation["overall"],
-        "test_by_horizon": evaluation["by_horizon"],
-        "test_by_node_type": evaluation["by_node_type"],
-        "checkpoint": str(checkpoint_path),
+        "experiment_id": run["experiment_id"],
+        "signature": run["signature"],
+        "git_commit": run["git_commit"],
+        "validation": evaluation["overall"],
+        "validation_by_horizon": evaluation["by_horizon"],
+        "validation_by_node_type": evaluation["by_node_type"],
+        "checkpoint": str(best_path),
+        "latest_checkpoint": str(latest_path),
     }
-    save_json(report, metrics_dir / f"{model_name}.json")
-    save_json({"model": model_name, "history": history}, project_root / outputs["logs_dir"] / f"{model_name}_history.json")
+    save_json(report, metrics_dir / "validation.json")
     return report
 
 
@@ -283,6 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
     parser.add_argument("--model", choices=["stgt", "gat_lstm"], required=True)
     parser.add_argument("--project-root", type=Path, default=Path("."))
+    parser.add_argument("--resume", type=Path, default=None)
     return parser
 
 
@@ -290,5 +365,5 @@ if __name__ == "__main__":
     arguments = build_parser().parse_args()
     root = arguments.project_root.resolve()
     configuration = load_yaml(root / arguments.config)
-    report = train_model(arguments.model, configuration, root)
+    report = train_model(arguments.model, configuration, root, arguments.resume)
     print(report)

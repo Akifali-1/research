@@ -1,230 +1,332 @@
-"""Sequential, budget-limited experiment controller.
+"""Semi-automated controller: user-authorized Colab, Drive, then sequential runs.
 
-This controller is designed to run in Colab after the interactive Drive and
-repository gates pass. It never submits more than one training subprocess at a
-time and never repeats a completed experiment signature.
+Only --allow-execution can start compute. Run signatures, immutable attempt
+directories, counted retries, validation-only selection, runtime limits, and
+artifact verification are shared by initial and resumed Colab sessions.
 """
-
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping
 
 import yaml
 
-from src.experiment_registry import (
-    ActiveExperiment,
-    BudgetExceeded,
-    Registry,
-    experiment_signature,
-)
-
+from src.experiment_registry import BudgetExceeded, RecoveryRequired, Registry, experiment_signature
 
 EXPECTED_ARCHIVES = {
-    "train.csv.7z",
-    "items.csv.7z",
-    "stores.csv.7z",
-    "transactions.csv.7z",
-    "oil.csv.7z",
-    "holidays_events.csv.7z",
-    "test.csv.7z",
-    "sample_submission.csv.7z",
+    f"{name}.csv.7z" for name in ("train", "items", "stores", "transactions", "oil",
+                                  "holidays_events", "test", "sample_submission")
 }
 
 
-def load_config(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+def load_config(path):
+    with Path(path).open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
 
 
-def git_commit(project_root: Path) -> str:
-    return subprocess.check_output(
-        ["git", "-C", str(project_root), "rev-parse", "HEAD"], text=True
-    ).strip()
+def write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    temporary.replace(path)
 
 
-def current_branch(project_root: Path) -> str:
-    return subprocess.check_output(
-        ["git", "-C", str(project_root), "rev-parse", "--abbrev-ref", "HEAD"], text=True
-    ).strip()
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def remote_head(project_root: Path, branch: str | None = None) -> str:
-    branch = branch or current_branch(project_root)
-    return subprocess.check_output(
-        ["git", "-C", str(project_root), "ls-remote", "origin", f"refs/heads/{branch}"], text=True
-    ).split()[0]
+def git_commit(root):
+    return subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
 
 
-def validate_pushed_repository(project_root: Path, branch: str | None = None) -> str:
-    local = git_commit(project_root)
-    remote = remote_head(project_root, branch)
-    if not local or local != remote:
-        raise RuntimeError(f"Repository is not pushed at the current commit: local={local}, remote={remote}")
-    return local
+def validate_pushed_repository(root, branch=None):
+    commit = git_commit(root)
+    branch = branch or subprocess.check_output(
+        ["git", "-C", str(root), "branch", "--show-current"], text=True).strip()
+    if not branch:
+        raise RuntimeError("A checked-out experiment branch is required")
+    remote = subprocess.check_output(
+        ["git", "-C", str(root), "ls-remote", "origin", f"refs/heads/{branch}"], text=True).strip()
+    if not remote or remote.split()[0] != commit:
+        raise RuntimeError(f"Push gate failed: {branch} is absent or differs from {commit}")
+    status = subprocess.check_output(["git", "-C", str(root), "status", "--porcelain"], text=True).strip()
+    if status:
+        raise RuntimeError("Source tree is dirty; commit/push source changes before running")
+    return commit
 
 
-def file_manifest(directory: Path, names: Iterable[str]) -> Dict[str, Any]:
+def require_colab_drive(*paths):
+    """This is a Colab-only execution boundary, not an authentication API."""
+    try:
+        available = importlib.util.find_spec("google.colab") is not None
+    except ModuleNotFoundError:
+        available = False
+    mount = Path("/content/drive")
+    mydrive = mount / "MyDrive"
+    if not available or not os.path.ismount(mount) or not mydrive.is_dir():
+        raise RuntimeError("Authorize Drive interactively in Google Colab before running compute")
+    for path in paths:
+        if not Path(path).resolve().is_relative_to(mydrive.resolve()):
+            raise RuntimeError(f"Dataset/artifact path must be on mounted Drive: {path}")
+
+
+def runtime_info():
+    import torch
+    packages = {}
+    for name in ("torch", "torch-geometric", "numpy", "pandas", "scikit-learn", "PyYAML", "py7zr"):
+        packages[name] = importlib.metadata.version(name)
+    free_disk = shutil.disk_usage("/content" if Path("/content").exists() else ".").free
+    memory = {}
+    if Path("/proc/meminfo").exists():
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith(("MemTotal:", "MemAvailable:")):
+                key, value, *_ = line.split()
+                memory[key.rstrip(":")] = int(value) * 1024
+    result = {"python": sys.version, "packages": packages, "cuda_available": torch.cuda.is_available(),
+              "free_runtime_disk_bytes": free_disk, "ram": memory}
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        result.update(gpu=torch.cuda.get_device_name(0), free_gpu_bytes=free, total_gpu_bytes=total)
+    return result
+
+
+def file_manifest(directory, names):
     entries = []
     for name in sorted(names):
-        path = directory / name
-        if not path.is_file() or path.stat().st_size == 0:
-            raise FileNotFoundError(f"Missing or empty required archive: {path}")
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        entries.append({"name": name, "bytes": path.stat().st_size, "sha256": digest.hexdigest()})
-    return {"dataset": "favorita-grocery-sales", "archives": entries}
+        path = Path(directory) / name
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"Required nonempty file is absent: {path}")
+        entries.append({"name": name, "bytes": path.stat().st_size, "sha256": sha256(path)})
+    return {"files": entries}
 
 
-def validate_archives(raw_dir: Path) -> Dict[str, Any]:
+def validate_archives(raw_dir):
+    import py7zr
     manifest = file_manifest(raw_dir, EXPECTED_ARCHIVES)
-    try:
-        import py7zr
-    except ImportError as exc:
-        raise RuntimeError("Install requirements.txt before validating .7z archives") from exc
-    archive_members = {}
-    for name in sorted(EXPECTED_ARCHIVES):
-        with py7zr.SevenZipFile(raw_dir / name, mode="r") as archive:
-            members = archive.getnames()
-        expected_member = name[:-3]
-        if members != [expected_member]:
-            raise ValueError(f"Unexpected member list in {name}: {members}")
-        archive_members[name] = members
-    manifest["archive_members"] = archive_members
+    manifest["dataset"] = "Corporación Favorita Grocery Sales Forecasting"
+    for entry in manifest["files"]:
+        with py7zr.SevenZipFile(Path(raw_dir) / entry["name"], "r") as archive:
+            members = archive.list()
+            if len(members) != 1 or members[0].filename != entry["name"][:-3]:
+                raise ValueError(f"Unexpected archive members: {entry['name']}")
+            entry["uncompressed_bytes"] = members[0].uncompressed
+    # Validate small metadata schemas without expanding the train archive.
+    import tempfile
+    import csv
+    with tempfile.TemporaryDirectory(prefix="favorita-schema-") as folder:
+        for stem, required in (("items", {"item_nbr", "family", "class", "perishable"}),
+                               ("stores", {"store_nbr", "city", "state", "type", "cluster"})):
+            with py7zr.SevenZipFile(Path(raw_dir) / f"{stem}.csv.7z", "r") as archive:
+                archive.extractall(path=folder)
+            with (Path(folder) / f"{stem}.csv").open(encoding="utf-8-sig", newline="") as handle:
+                columns = next(csv.reader(handle))
+            if not required.issubset(columns):
+                raise ValueError(f"{stem}.csv is not the expected Favorita schema")
     return manifest
 
 
-def validate_budget(registry: Registry) -> Dict[str, Any]:
+def scientific_configuration(config):
+    data = {key: value for key, value in config["data"].items() if key != "processed_dir"}
+    return {"seed": config["seed"], "deterministic": config.get("deterministic", True),
+            "data": data, "training": config["training"], "models": config["models"]}
+
+
+def verify_processed(data_dir, raw_manifest):
+    from src.preprocessing import validate_outputs
+    data_dir = Path(data_dir)
+    completed = json.loads((data_dir / "complete.json").read_text())
+    if completed["raw_manifest"] != raw_manifest:
+        raise ValueError("Processed data does not match the verified Drive archives")
+    manifest = file_manifest(data_dir, ("sales.csv", "nodes.csv", "edges.csv", "data_quality.json"))
+    if manifest != completed["processed_manifest"]:
+        raise ValueError("Processed data changed since preprocessing completed")
+    validate_outputs(data_dir)
+    return manifest
+
+
+def validate_completed_artifacts(record):
+    artifact = Path(record["artifact_dir"])
+    manifest = record.get("artifact_manifest")
+    if not manifest or file_manifest(artifact, [item["name"] for item in manifest["files"]]) != manifest:
+        raise RuntimeError(f"Completed run artifacts are missing/changed: {record['experiment_id']}; do not retrain silently")
+
+
+def prepare_data(root, config_path, raw_dir, processed_base, branch=None):
+    """Colab preprocessing stage; versioned output, durable log, completion marker."""
+    require_colab_drive(raw_dir, processed_base)
+    commit = validate_pushed_repository(root, branch)
+    config = load_config(config_path)
+    raw = validate_archives(raw_dir)
+    identity = experiment_signature("preprocessing", config["preprocessing"], commit, raw)
+    destination = Path(processed_base) / identity[:16]
+    if (destination / "complete.json").exists():
+        verify_processed(destination, raw)
+        print(f"Verified existing processed version: {destination}")
+        return destination
+    if destination.exists():
+        raise RecoveryRequired(f"Incomplete preprocessing exists at {destination}; inspect it, then use a new processed base for an explicit restart")
+    info = runtime_info()
+    destination.mkdir(parents=True)
+    write_json(destination / "preprocessing_state.json", {"status": "running", "git_commit": commit,
+                                                         "configuration": config["preprocessing"], "raw_manifest": raw})
+    prep = config["preprocessing"]
+    command = [sys.executable, str(root / "src/preprocessing.py"), "--raw-dir", str(raw_dir),
+               "--processed-dir", str(destination),
+               "--start-date", str(prep["start_date"]), "--end-date", str(prep["end_date"]),
+               "--chunksize", str(prep["chunksize"]), "--missing-policy", prep["missing_policy"]]
+    try:
+        with (destination / "preprocessing.log").open("w") as log:
+            subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True,
+                           timeout=int(prep["max_seconds"]))
+        manifest = file_manifest(destination, ("sales.csv", "nodes.csv", "edges.csv", "data_quality.json"))
+        write_json(destination / "complete.json", {"raw_manifest": raw, "processed_manifest": manifest,
+                                                    "git_commit": commit, "configuration": prep})
+        verify_processed(destination, raw)
+        write_json(destination / "preprocessing_state.json", {"status": "completed", "git_commit": commit})
+        return destination
+    except BaseException as exc:
+        write_json(destination / "preprocessing_state.json", {"status": "failed", "failure": str(exc), "git_commit": commit})
+        raise
+
+
+def validate_budget(registry):
     status = registry.status()
     if status["active_experiments"]:
-        raise RuntimeError(f"Active experiments require explicit recovery: {status['active_experiments']}")
-    if status["remaining_runs"] <= 0:
-        raise BudgetExceeded("No GPU experiment budget remains")
+        raise RecoveryRequired(f"Active record(s): {status['active_experiments']}. Confirm no runtime still runs before explicit recovery.")
     return status
 
 
-def run_sequential(
-    *,
-    project_root: Path,
-    config_path: Path,
-    raw_dir: Path,
-    registry_path: Path,
-    models: Iterable[str],
-    max_runs: int,
-    allow_execution: bool,
-    force_retry: bool = False,
-    branch: str | None = None,
-) -> list[Dict[str, Any]]:
+def run_sequential(*, project_root, config_path, raw_dir, registry_path, models,
+                   max_runs=10, allow_execution=False, force_retry=False, branch=None):
     if not allow_execution:
-        raise RuntimeError("Execution is disabled. Pass --allow-execution only after all Colab gates pass.")
-    commit = validate_pushed_repository(project_root, branch)
-    manifest = validate_archives(raw_dir)
+        raise RuntimeError("Execution is disabled; authorize notebook gates first")
     config = load_config(config_path)
-    registry = Registry(registry_path, max_runs=max_runs, max_retries=2)
+    artifacts = Path(config["outputs"]["drive_artifact_root"])
+    processed = Path(config["data"]["processed_dir"])
+    require_colab_drive(raw_dir, registry_path, artifacts, processed)
+    commit = validate_pushed_repository(project_root, branch)
+    raw = validate_archives(raw_dir)
+    processed_manifest = verify_processed(processed, raw)
+    dataset = {"raw": raw, "processed": processed_manifest}
+    info = runtime_info()
+    if not info["cuda_available"]:
+        raise RuntimeError("Select a GPU runtime in Colab; no training run reserved")
+    registry = Registry(registry_path, max_runs=min(max_runs, int(config["experiment"]["max_gpu_runs"])),
+                        max_retries=int(config["experiment"]["max_retries_per_signature"]))
     validate_budget(registry)
+    deadline = registry.establish_deadline(int(config["experiment"]["overall_max_seconds"]))
+    deadline_seconds = datetime.fromisoformat(deadline).timestamp()
     reports = []
     for model in models:
-        signature = experiment_signature(model, config, commit, manifest)
-        artifact_dir = Path(config["outputs"].get("drive_artifact_root", "results")) / model / signature[:12]
-        reservation = registry.reserve(
-            model=model,
-            signature=signature,
-            configuration=config,
-            git_commit=commit,
-            dataset_manifest=manifest,
-            artifact_dir=artifact_dir,
-            force_retry=force_retry,
-        )
-        if reservation["action"] == "skip_completed":
-            reports.append({"model": model, "action": "skip_completed", "record": reservation["record"]})
+        signature = experiment_signature(model, scientific_configuration(config), commit, dataset)
+        matches = registry.matching(signature)
+        completed = [record for record in matches if record["status"] == "completed"]
+        if completed:
+            validate_completed_artifacts(completed[-1])
+            reports.append({"model": model, "action": "skip_completed", "record": completed[-1]})
+            print(f"Skipped completed run: {completed[-1]['experiment_id']}", flush=True)
             continue
+        remaining_seconds = int(deadline_seconds - time.time())
+        if remaining_seconds <= 0:
+            raise BudgetExceeded("Campaign deadline reached; checkpoints and logs remain on Drive")
+        run_limit = min(int(config["experiment"]["max_job_seconds"]), remaining_seconds)
+        reservation = registry.reserve(model=model, signature=signature, configuration=config, git_commit=commit,
+                                       dataset_manifest=dataset, artifact_dir=artifacts, force_retry=force_retry)
         record = reservation["record"]
         experiment_id = record["experiment_id"]
-        registry.update(experiment_id, "running", started_at=record["updated_at"])
-        command = [
-            sys.executable,
-            str(project_root / "src" / "train.py"),
-            "--model",
-            model,
-            "--config",
-            str(config_path),
-            "--project-root",
-            str(project_root),
-        ]
-        log_path = Path(record["artifact_dir"]) / "training.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact = Path(record["artifact_dir"])
         try:
+            artifact.mkdir(parents=True, exist_ok=False)
+            run_config = copy.deepcopy(config)
+            run_config["experiment"]["max_job_seconds"] = max(1, run_limit - 30)
+            run_config["outputs"].update({key: str(artifact / sub) for key, sub in
+                                         (("checkpoint_dir", "checkpoints"), ("metrics_dir", "metrics"),
+                                          ("predictions_dir", "predictions"), ("logs_dir", "logs"))})
+            run_config["run"] = {"experiment_id": experiment_id, "signature": signature, "git_commit": commit}
+            attempt_config = artifact / "config.yaml"
+            attempt_config.write_text(yaml.safe_dump(run_config, sort_keys=False))
+            write_json(artifact / "runtime.json", info)
+            write_json(artifact / "dataset_manifest.json", dataset)
+            command = [sys.executable, "-u", str(project_root / "src/train.py"), "--model", model,
+                       "--config", str(attempt_config), "--project-root", str(project_root)]
+            if matches:
+                latest = Path(matches[-1]["artifact_dir"]) / "checkpoints/latest.pt"
+                if not latest.exists():
+                    raise RecoveryRequired("Retry has no committed epoch checkpoint. Inspect failure; explicitly change configuration for a fresh run.")
+                command.extend(["--resume", str(latest)])
+            log_path = artifact / "training.log"
+            registry.update(experiment_id, "running", command=command, runtime=info, config_path=str(attempt_config))
+            print(f"Running {experiment_id}; budget={registry.status()['submitted_runs']}/{registry.status()['max_runs']}; log={log_path}", flush=True)
             with log_path.open("w", encoding="utf-8") as log:
-                completed = subprocess.run(command, cwd=project_root, stdout=log, stderr=subprocess.STDOUT, check=False)
-            if completed.returncode != 0:
-                registry.update(
-                    experiment_id,
-                    "failed",
-                    exit_code=completed.returncode,
-                    failure={"reason": "training subprocess failed", "log": str(log_path)},
-                )
-                reports.append({"model": model, "action": "failed", "record": experiment_id})
-                continue
-            report_path = project_root / config["outputs"]["metrics_dir"] / f"{model}.json"
-            if not report_path.exists():
-                registry.update(
-                    experiment_id,
-                    "failed",
-                    exit_code=completed.returncode,
-                    failure={"reason": "training completed without metrics artifact", "log": str(log_path)},
-                )
-                reports.append({"model": model, "action": "failed_missing_artifact", "record": experiment_id})
-                continue
-            registry.update(experiment_id, "completed", exit_code=0, report=str(report_path), log=str(log_path))
-            reports.append({"model": model, "action": "completed", "record": experiment_id, "report": str(report_path)})
-        except KeyboardInterrupt:
-            registry.update(experiment_id, "interrupted", failure={"reason": "keyboard interrupt", "log": str(log_path)})
+                result = subprocess.run(command, cwd=project_root, stdout=log, stderr=subprocess.STDOUT,
+                                        timeout=run_limit, check=False)
+            if result.returncode:
+                raise RuntimeError(f"Training exited {result.returncode}; see {log_path}")
+            relative_files = ["config.yaml", "runtime.json", "dataset_manifest.json", "training.log",
+                              "checkpoints/best.pt", "checkpoints/latest.pt", "predictions/validation.npz", "metrics/validation.json", "logs/history.json"]
+            report = json.loads((artifact / "metrics/validation.json").read_text())
+            if report["experiment_id"] != experiment_id or report["signature"] != signature:
+                raise ValueError("Returned metrics do not match the registered attempt")
+            artifact_manifest = file_manifest(artifact, relative_files)
+            registry.update(experiment_id, "completed", exit_code=0, report=str(artifact / "metrics/validation.json"),
+                            artifact_manifest=artifact_manifest, completed_at=datetime.now(timezone.utc).isoformat())
+            reports.append({"model": model, "action": "completed", "record": registry.matching(signature)[-1]})
+        except BaseException as exc:
+            status = "interrupted" if isinstance(exc, (KeyboardInterrupt, subprocess.TimeoutExpired)) else "failed"
+            registry.update(experiment_id, status, failure={"type": type(exc).__name__, "reason": str(exc)},
+                            latest_checkpoint=str(artifact / "checkpoints/latest.pt"))
+            # Stop rather than silently submit retries or consume the next slot.
             raise
     return reports
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", type=Path, default=Path("."))
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
-    parser.add_argument("--raw-dir", type=Path, required=True)
+    parser.add_argument("--raw-dir", type=Path)
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--models", nargs="+", choices=["stgt", "gat_lstm"], default=["stgt", "gat_lstm"])
     parser.add_argument("--max-runs", type=int, default=10)
     parser.add_argument("--allow-execution", action="store_true")
     parser.add_argument("--force-retry", action="store_true")
-    parser.add_argument("--branch", default=None)
+    parser.add_argument("--branch")
     parser.add_argument("--status-only", action="store_true")
+    parser.add_argument("--recover-interrupted", action="store_true")
     return parser
 
 
 if __name__ == "__main__":
-    arguments = build_parser().parse_args()
-    root = arguments.project_root.resolve()
-    registry_path = arguments.registry if arguments.registry.is_absolute() else root / arguments.registry
-    registry = Registry(registry_path, max_runs=arguments.max_runs, max_retries=2)
-    if arguments.status_only:
+    args = build_parser().parse_args()
+    root = args.project_root.resolve()
+    registry = Registry(args.registry, max_runs=args.max_runs)
+    if args.status_only:
         print(json.dumps(registry.status(), indent=2))
+    elif args.recover_interrupted:
+        confirm = input("Confirm no notebook/process is still running. Type RECOVER: ")
+        if confirm != "RECOVER":
+            raise SystemExit("Recovery not confirmed")
+        print(registry.mark_interrupted_active("user-confirmed inactive previous session"))
     else:
-        raw = arguments.raw_dir if arguments.raw_dir.is_absolute() else root / arguments.raw_dir
-        config = arguments.config if arguments.config.is_absolute() else root / arguments.config
-        result = run_sequential(
-            project_root=root,
-            config_path=config,
-            raw_dir=raw,
-            registry_path=registry_path,
-            models=arguments.models,
-            max_runs=arguments.max_runs,
-            allow_execution=arguments.allow_execution,
-            force_retry=arguments.force_retry,
-            branch=arguments.branch,
-        )
-        print(json.dumps(result, indent=2, default=str))
+        if args.raw_dir is None:
+            raise SystemExit("--raw-dir is required for execution")
+        print(json.dumps(run_sequential(project_root=root, config_path=args.config.resolve(), raw_dir=args.raw_dir,
+                                       registry_path=args.registry, models=args.models, max_runs=args.max_runs,
+                                       allow_execution=args.allow_execution, force_retry=args.force_retry,
+                                       branch=args.branch), indent=2, default=str))

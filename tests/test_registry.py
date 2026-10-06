@@ -85,6 +85,7 @@ def test_interrupted_run_can_be_explicitly_retried(tmp_path):
         git_commit="a",
         dataset_manifest={},
         artifact_dir=tmp_path,
+        force_retry=True,
     )
     assert second["record"]["attempt"] == 2
     assert registry.status()["submitted_runs"] == 2

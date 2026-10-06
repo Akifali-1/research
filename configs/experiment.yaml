@@ -9,6 +9,15 @@ experiment:
   require_drive_authorization: true
   require_archive_validation: true
   allow_execution: false
+  max_job_seconds: 7200
+  overall_max_seconds: 21600
+
+preprocessing:
+  start_date: '2015-01-01'
+  end_date: '2017-08-15'
+  chunksize: 500000
+  missing_policy: zero
+  max_seconds: 7200
 
 data:
   processed_dir: data/processed
@@ -16,7 +25,7 @@ data:
   train_ratio: 0.70
   validation_ratio: 0.15
   lookback: 14
-  horizon: 1
+  horizon: 7
   undirected_graph: true
   use_residual_baseline: false
 

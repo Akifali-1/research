@@ -17,7 +17,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, Optional
+from typing import Any, Dict, Iterator, Mapping
 
 
 ACTIVE_STATUSES = {"reserved", "running"}
@@ -55,6 +55,10 @@ class ActiveExperiment(RuntimeError):
     """Raised when another run is already active."""
 
 
+class RecoveryRequired(RuntimeError):
+    """A failed/interrupted attempt requires explicit retry authorization."""
+
+
 class Registry:
     def __init__(self, path: Path | str, max_runs: int = 10, max_retries: int = 2):
         self.path = Path(path)
@@ -63,6 +67,8 @@ class Registry:
         self.max_retries = int(max_retries)
         if self.max_runs < 1 or self.max_retries < 0:
             raise ValueError("max_runs must be positive and max_retries cannot be negative")
+        if self.max_runs > 10 or self.max_retries > 2:
+            raise ValueError("Hard limits are 10 submitted runs and 2 retries; approval is required to raise them")
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
@@ -108,6 +114,14 @@ class Registry:
         payload["budget"].setdefault("max_runs", self.max_runs)
         payload["budget"].setdefault("max_retries_per_signature", self.max_retries)
         payload["budget"].setdefault("submitted_runs", 0)
+        budget = payload["budget"]
+        if int(budget["max_runs"]) > 10 or int(budget["max_retries_per_signature"]) > 2:
+            raise ValueError("Registry exceeds the approved hard limits")
+        # Config changes cannot silently increase an existing campaign's budget.
+        budget["max_runs"] = min(int(budget["max_runs"]), self.max_runs)
+        budget["max_retries_per_signature"] = min(int(budget["max_retries_per_signature"]), self.max_retries)
+        if int(budget["submitted_runs"]) != len(payload["experiments"]):
+            raise ValueError("Registry submission count is inconsistent; inspect it before execution")
         return payload
 
     def _write_unlocked(self, payload: Mapping[str, Any]) -> None:
@@ -140,7 +154,20 @@ class Registry:
             "completed_experiments": [
                 item["experiment_id"] for item in payload["experiments"] if item.get("status") == "completed"
             ],
+            "deadline_at": payload.get("deadline_at"),
         }
+
+    def establish_deadline(self, maximum_seconds: int) -> str:
+        """Persist a campaign deadline once; a runtime restart cannot reset it."""
+        from datetime import timedelta
+        if maximum_seconds <= 0:
+            raise ValueError("Campaign runtime must be positive")
+        with self._lock():
+            payload = self._read_unlocked()
+            if "deadline_at" not in payload:
+                payload["deadline_at"] = (datetime.now(timezone.utc) + timedelta(seconds=maximum_seconds)).isoformat()
+                self._write_unlocked(payload)
+            return payload["deadline_at"]
 
     def _matching_unlocked(self, payload: Mapping[str, Any], signature: str):
         return [item for item in payload["experiments"] if item.get("signature") == signature]
@@ -161,15 +188,17 @@ class Registry:
             payload = self._read_unlocked()
             matches = self._matching_unlocked(payload, signature)
             completed = [item for item in matches if item.get("status") == "completed"]
-            if completed and not force_retry:
+            if completed:
                 return {"action": "skip_completed", "record": completed[-1]}
             active = [item for item in payload["experiments"] if item.get("status") in ACTIVE_STATUSES]
             if active:
                 raise ActiveExperiment(f"An experiment is already active: {active[-1]['experiment_id']}")
             attempts = len(matches)
-            if force_retry and attempts > self.max_retries:
-                raise BudgetExceeded(f"Retry limit exceeded for signature {signature[:12]}")
+            if matches and not force_retry:
+                raise RecoveryRequired("Previous attempt is unfinished or failed; use explicit retry/recovery")
             budget = payload["budget"]
+            if attempts >= 1 + int(budget["max_retries_per_signature"]):
+                raise BudgetExceeded(f"Retry limit exceeded for signature {signature[:12]}")
             if int(budget["submitted_runs"]) >= int(budget["max_runs"]):
                 raise BudgetExceeded(
                     f"GPU experiment budget exhausted: {budget['submitted_runs']}/{budget['max_runs']}"
@@ -186,7 +215,7 @@ class Registry:
                 "git_commit": git_commit,
                 "configuration": dict(configuration),
                 "dataset_manifest": dict(dataset_manifest),
-                "artifact_dir": str(artifact_dir),
+                "artifact_dir": str(Path(artifact_dir) / experiment_id),
                 "failure": None,
                 "exit_code": None,
             }
@@ -202,12 +231,18 @@ class Registry:
             payload = self._read_unlocked()
             for record in payload["experiments"]:
                 if record.get("experiment_id") == experiment_id:
+                    if record.get("status") == "completed" and status != "completed":
+                        raise ValueError("Completed experiment records are immutable")
                     record.update(fields)
                     record["status"] = status
                     record["updated_at"] = utc_now()
                     self._write_unlocked(payload)
                     return record
         raise KeyError(f"Unknown experiment: {experiment_id}")
+
+    def matching(self, signature: str) -> list[Dict[str, Any]]:
+        payload = self.snapshot()
+        return self._matching_unlocked(payload, signature)
 
     def mark_interrupted_active(self, reason: str = "session resumed") -> int:
         count = 0

@@ -66,6 +66,8 @@ class ReferenceSTGT(nn.Module):
         self.dropout_rate = dropout
         self.temporal_encoder = TemporalAttention(1, d_model, lookback, temporal_heads, dropout)
         self.type_embedding = nn.Embedding(node_type_count, d_model)
+        if d_model % spatial_heads != 0:
+            raise ValueError("d_model must be divisible by spatial_heads")
         channels = d_model // spatial_heads
         self.conv1 = TransformerConv(d_model, channels, heads=spatial_heads, dropout=dropout)
         self.conv2 = TransformerConv(d_model, channels, heads=spatial_heads, dropout=dropout)

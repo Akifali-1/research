@@ -133,6 +133,9 @@ multi-step baseline would leak information.
 ## Fair comparison
 
 Both models use the same `ExperimentData` object, graph, node order, scaler,
+chronological split, lookback, horizon, Huber loss, and validation-only
+checkpoint selection rule. The training entry point requires a registered
+controller run and is intentionally not a free-standing GPU command.
 
 The default configuration uses:
 
@@ -140,7 +143,7 @@ The default configuration uses:
 seed: 42
 split: 70% train / 15% validation / 15% test
 lookback: 14
-horizon: 1
+horizon: 7
 scaler: StandardScaler
 ```
 
@@ -148,23 +151,39 @@ The data loader uses historical context across split boundaries but never
 targets a future date in an earlier split. MAPE is masked to actual values
 above `0.1`; WAPE and sMAPE remain defined for zero-demand observations.
 
-Train each model independently:
+The semi-automated controller is the supported training entry point after the
+interactive Colab gates pass:
 
 ```bash
-python src/train.py --model stgt --config configs/experiment.yaml
-python src/train.py --model gat_lstm --config configs/experiment.yaml
+python orchestrator.py \
+  --project-root . \
+  --branch research/initial-pipeline \
+  --config /content/experiment_colab.yaml \
+  --raw-dir /content/drive/MyDrive/supply_chain_research/data/raw \
+  --registry /content/drive/MyDrive/supply_chain_research/experiment_registry.json \
+  --models stgt gat_lstm \
+  --max-runs 10 \
+  --allow-execution
 ```
 
-Then compare saved checkpoints:
+It creates immutable per-attempt Drive directories, records logs and runtime
+metadata, resumes only with explicit retry authorization, and skips completed
+signatures. The direct `src/train.py` command is an internal controller target
+and requires a registered `run` block.
+
+After validation-only training completes, compare saved checkpoints:
 
 ```bash
 python src/evaluate.py \
-  --stgt-checkpoint results/checkpoints/stgt.pt \
-  --gat-lstm-checkpoint results/checkpoints/gat_lstm.pt \
+  --stgt-checkpoint /path/to/drive/experiments/stgt/<id>/checkpoints/best.pt \
+  --gat-lstm-checkpoint /path/to/drive/experiments/gat_lstm/<id>/checkpoints/best.pt \
   --config configs/experiment.yaml
 ```
 
-Outputs include JSON reports, test predictions, checkpoints, per-horizon and
+Outputs include JSON reports, validation predictions, checkpoints, per-horizon and
+per-node-type metrics, parameter count, training time, inference time, and
+peak GPU memory when available. Test evaluation is a separate step and is not
+used for checkpoint selection. No result is automatically labeled superior.
 
 ## Colab workflow
 
@@ -196,13 +215,15 @@ It uses a JSON registry stored in Drive to enforce:
 - explicit records for reserved, running, completed, failed, and interrupted runs;
 - configuration, Git commit, dataset archive hashes, logs, and artifact paths.
 
-The notebook refuses to proceed unless the cloned commit matches `origin/HEAD`,
+The notebook refuses to proceed unless the cloned commit matches the pushed
+experiment branch,
 Drive has been mounted interactively, all eight raw archives and their inner
-members validate, and a budget slot remains. A separate confirmation cell
-requires the user to type `RUN`. Until that happens, no training subprocess is
-started. A restarted session marks stale active records as interrupted and can
-resume them as a new counted attempt; completed records are skipped by their
-deterministic signature.
+members validate, and a budget slot remains. Separate confirmation cells
+require `PREPROCESS`, then `RUN`; until those inputs are provided, no large
+operation or training subprocess is started. A restarted session requires
+explicit confirmation before marking stale active records interrupted. Failed
+or interrupted attempts require an explicit `RETRY` and a new counted attempt;
+completed records are skipped by their deterministic signature.
 
 The first source push must happen before the notebook can pass its repository
 gate:

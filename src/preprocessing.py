@@ -118,7 +118,6 @@ def _aggregate_chunk(
 ) -> None:
     chunk = chunk.copy()
     chunk["date"] = pd.to_datetime(chunk["date"], errors="coerce")
-    counters["invalid_dates"] += int(chunk["date"].isna().sum())
     chunk = chunk.loc[chunk["date"].notna()].copy()
     chunk["unit_sales"] = pd.to_numeric(chunk["unit_sales"], errors="coerce")
     counters["invalid_sales"] += int(chunk["unit_sales"].isna().sum())
@@ -127,6 +126,8 @@ def _aggregate_chunk(
     counters["negative_sales"] += negative_count
     # Returns/corrections are retained in the raw data but demand is non-negative.
     chunk["unit_sales"] = chunk["unit_sales"].clip(lower=0.0)
+    duplicate_keys = chunk.duplicated(["date", "store_nbr", "item_nbr"], keep=False)
+    counters["duplicate_business_key_rows"] += int(duplicate_keys.sum())
 
     chunk["family"] = chunk["item_nbr"].map(item_to_family)
     locations = chunk["store_nbr"].map(store_to_location)
@@ -183,7 +184,7 @@ def preprocess(
         train_path,
         usecols=usecols,
         chunksize=chunksize,
-        dtype={"id": "int64", "store_nbr": "int16", "item_nbr": "int32", "unit_sales": "float32"},
+        dtype={"id": "int64", "store_nbr": "int16", "item_nbr": "int32"},
     ):
         chunk["date"] = pd.to_datetime(chunk["date"], errors="coerce")
         counters["invalid_dates"] += int(chunk["date"].isna().sum())
@@ -279,6 +280,7 @@ def preprocess(
         "invalid_dates": counters["invalid_dates"],
         "invalid_sales": counters["invalid_sales"],
         "negative_sales_clipped": counters["negative_sales"],
+        "duplicate_business_key_rows_aggregated": counters["duplicate_business_key_rows"],
         "missing_metadata_rows": counters["missing_metadata_rows"],
         "missing_observation_policy": missing_policy,
         "missing_observations_filled_zero": int(missing_cells),
