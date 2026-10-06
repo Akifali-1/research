@@ -99,5 +99,51 @@ class ReferenceSTGT(nn.Module):
         return output.reshape(batch_size, num_nodes, self.horizon)
 
 
+class AdaptiveSTGT(ReferenceSTGT):
+    """STGT with a learned gate between temporal and graph representations.
+
+    The temporal encoder produces the temporal branch. The graph branch applies
+    the existing node-type embedding and two TransformerConv layers. A
+    feature-wise sigmoid gate combines both branches before the shared forecast
+    head. This is a proposed variant, not a reproduction of a published model.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(2 * self.d_model, self.d_model),
+            nn.Sigmoid(),
+        )
+        self.fusion_norm = nn.LayerNorm(self.d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        node_types: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError("Adaptive STGT expects x with shape [batch, nodes, lookback, channels]")
+        batch_size, num_nodes, lookback, _ = x.shape
+        if lookback != self.lookback:
+            raise ValueError(f"Expected lookback={self.lookback}, received {lookback}")
+        if node_types.shape[0] != num_nodes:
+            raise ValueError("node_types must contain one value per graph node")
+
+        temporal = self.temporal_encoder(x.reshape(batch_size * num_nodes, lookback, -1))
+        types = self.type_embedding(node_types).repeat(batch_size, 1)
+        spatial = temporal + types
+        batched_edges = repeat_edge_index(edge_index, batch_size, num_nodes)
+        spatial = F.elu(self.conv1(spatial, batched_edges))
+        spatial = F.dropout(spatial, p=self.dropout_rate, training=self.training)
+        spatial = F.elu(self.conv2(spatial, batched_edges))
+        spatial = F.dropout(spatial, p=self.dropout_rate, training=self.training)
+
+        gate = self.fusion_gate(torch.cat([temporal, spatial], dim=-1))
+        fused = self.fusion_norm(gate * spatial + (1.0 - gate) * temporal)
+        output = self.fc(fused)
+        return output.reshape(batch_size, num_nodes, self.horizon)
+
+
 # Backward-compatible descriptive alias for experiment configuration.
 STGTModel = ReferenceSTGT
