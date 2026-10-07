@@ -48,6 +48,17 @@ class ExperimentData:
         self.nodes, self.edges, self.sales = read_processed_data(data_dir)
         self.node_names = self.nodes["node_id"].astype(str).tolist()
         self.node_type_ids = node_type_ids(self.nodes)
+        configured_edge_types = data_config.get("graph_edge_types")
+        if configured_edge_types is not None:
+            configured_edge_types = {str(edge_type) for edge_type in configured_edge_types}
+            if "edge_type" not in self.edges.columns:
+                raise ValueError("graph_edge_types requires edges.csv to contain edge_type")
+            unknown_edge_types = configured_edge_types - set(self.edges["edge_type"].astype(str))
+            if unknown_edge_types:
+                raise ValueError(f"Configured graph edge types are absent from edges.csv: {sorted(unknown_edge_types)}")
+            self.edges = self.edges[self.edges["edge_type"].astype(str).isin(configured_edge_types)].copy()
+            if self.edges.empty:
+                raise ValueError("Configured graph edge types produced an empty graph")
         self.edge_index = build_edge_index(self.nodes, self.edges, data_config.get("undirected_graph", True))
         self.dates = pd.to_datetime(self.sales["Date"]).dt.strftime("%Y-%m-%d").tolist()
         raw_series = self.sales[self.node_names].to_numpy(dtype=np.float32).T
