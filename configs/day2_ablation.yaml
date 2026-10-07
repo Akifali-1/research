@@ -1,0 +1,79 @@
+seed: 42
+seeds: [42, 123, 2026]
+deterministic: true
+
+experiment:
+  name: day2_ablation
+  max_gpu_runs: 15
+  max_retries_per_signature: 0
+  one_active_run: true
+  registry_path: /content/drive/MyDrive/supply_chain_research/experiment_registry_day2_ablation.json
+  require_archive_validation: true
+  require_drive_authorization: true
+  require_pushed_commit: true
+  allow_execution: false
+  max_job_seconds: 7200
+  overall_max_seconds: 43200
+
+preprocessing:
+  start_date: '2015-01-01'
+  end_date: '2017-08-15'
+  chunksize: 500000
+  missing_policy: zero
+  max_seconds: 7200
+
+data:
+  processed_dir: /content/drive/MyDrive/supply_chain_research/data/processed/9c7c18061dc1fbf5
+  scaler: standard
+  train_ratio: 0.70
+  validation_ratio: 0.15
+  lookback: 14
+  horizon: 7
+  undirected_graph: true
+  use_residual_baseline: false
+
+training:
+  batch_size: 4
+  epochs: 100
+  patience: 15
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  loss: huber
+  huber_delta: 1.0
+  scheduler_factor: 0.5
+  scheduler_patience: 8
+
+models:
+  temporal_only:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  spatial_only:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  fixed_fusion:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  stgt:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  adaptive_stgt:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+
+outputs:
+  drive_artifact_root: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/day2_ablation
+  checkpoint_dir: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/day2_ablation/_controller/checkpoints
+  metrics_dir: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/day2_ablation/_controller/metrics
+  predictions_dir: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/day2_ablation/_controller/predictions
+  logs_dir: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/day2_ablation/_controller/logs

@@ -21,6 +21,7 @@ from dataset import GraphWindowDataset, make_loader
 from gat_lstm import AdaptiveFusionGATLSTM
 from metrics import forecasting_metrics, metrics_by_horizon, metrics_by_node_type
 from stgt import AdaptiveSTGT, ReferenceSTGT
+from day2_ablation import DAY2_VARIANTS, FixedFusionSTGT, SpatialOnlySTGT, TemporalOnlySTGT
 from utils import (
     build_edge_index,
     fit_scale_matrix,
@@ -104,13 +105,19 @@ def build_model(model_name: str, config: Dict[str, Any], data: ExperimentData) -
         return ReferenceSTGT(**common, **model_config)
     if model_name == "adaptive_stgt":
         return AdaptiveSTGT(**common, **model_config)
+    if model_name == "temporal_only":
+        return TemporalOnlySTGT(**common, **model_config)
+    if model_name == "spatial_only":
+        return SpatialOnlySTGT(**common, **model_config)
+    if model_name == "fixed_fusion":
+        return FixedFusionSTGT(**common, **model_config)
     if model_name == "gat_lstm":
         return AdaptiveFusionGATLSTM(**common, **model_config)
     raise ValueError(f"Unsupported model: {model_name}")
 
 
 def _call_model(model_name: str, model: torch.nn.Module, batch: Dict[str, torch.Tensor], edge_index, node_types):
-    if model_name in {"stgt", "adaptive_stgt"}:
+    if model_name in {"stgt", "adaptive_stgt", *DAY2_VARIANTS}:
         return model(batch["x"], edge_index, node_types)
     return model(batch["x"], edge_index)
 
@@ -371,7 +378,7 @@ def train_model(model_name: str, config: Dict[str, Any], project_root: Path, res
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
-    parser.add_argument("--model", choices=["stgt", "adaptive_stgt", "gat_lstm"], required=True)
+    parser.add_argument("--model", choices=["stgt", "adaptive_stgt", "gat_lstm", *DAY2_VARIANTS], required=True)
     parser.add_argument("--project-root", type=Path, default=Path("."))
     parser.add_argument("--resume", type=Path, default=None)
     return parser
