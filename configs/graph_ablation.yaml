@@ -7,7 +7,7 @@ experiment:
   max_gpu_runs: 6
   max_retries_per_signature: 0
   one_active_run: true
-  registry_path: /content/drive/MyDrive/supply_chain_research/experiment_registry_graph_ablation.json
+  registry_path: /content/drive/.shortcut-targets-by-id/1jMUTXWHeee5LVuRralPSP1dFOLHXith-/supply_chain_research/experiment_registry_graph_ablation.json
   require_archive_validation: true
   require_drive_authorization: true
   require_pushed_commit: true
@@ -23,7 +23,7 @@ preprocessing:
   max_seconds: 7200
 
 data:
-  processed_dir: /content/drive/MyDrive/supply_chain_research/data/processed/9c7c18061dc1fbf5
+  processed_dir: /content/drive/.shortcut-targets-by-id/1jMUTXWHeee5LVuRralPSP1dFOLHXith-/supply_chain_research/data/processed/9c7c18061dc1fbf5
   scaler: standard
   train_ratio: 0.70
   validation_ratio: 0.15
@@ -66,8 +66,8 @@ graph_variants:
     assumption: "Retain region-city and city-store hierarchy edges; global family nodes remain in the node table but are isolated."
 
 outputs:
-  drive_artifact_root: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation
-  checkpoint_dir: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation/_controller/checkpoints
-  metrics_dir: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation/_controller/metrics
-  predictions_dir: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation/_controller/predictions
-  logs_dir: /content/drive/MyDrive/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation/_controller/logs
+  drive_artifact_root: /content/drive/.shortcut-targets-by-id/1jMUTXWHeee5LVuRralPSP1dFOLHXith-/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation
+  checkpoint_dir: /content/drive/.shortcut-targets-by-id/1jMUTXWHeee5LVuRralPSP1dFOLHXith-/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation/_controller/checkpoints
+  metrics_dir: /content/drive/.shortcut-targets-by-id/1jMUTXWHeee5LVuRralPSP1dFOLHXith-/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation/_controller/metrics
+  predictions_dir: /content/drive/.shortcut-targets-by-id/1jMUTXWHeee5LVuRralPSP1dFOLHXith-/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation/_controller/predictions
+  logs_dir: /content/drive/.shortcut-targets-by-id/1jMUTXWHeee5LVuRralPSP1dFOLHXith-/supply_chain_research/experiments/adaptive_stgt_campaign/graph_ablation/_controller/logs

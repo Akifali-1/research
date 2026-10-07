@@ -85,7 +85,7 @@ def require_colab_drive(*paths):
     if not available or not os.path.ismount(mount) or not mydrive.is_dir():
         raise RuntimeError("Authorize Drive interactively in Google Colab before running compute")
     for path in paths:
-        if not Path(path).resolve().is_relative_to(mydrive.resolve()):
+        if not Path(path).resolve().is_relative_to(mount.resolve()):
             raise RuntimeError(f"Dataset/artifact path must be on mounted Drive: {path}")
 
 
