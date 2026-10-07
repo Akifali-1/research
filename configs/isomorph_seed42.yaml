@@ -1,0 +1,77 @@
+seed: 42
+seeds: [42]
+deterministic: true
+
+experiment:
+  name: isomorph_sample_inventory_seed42
+  max_gpu_runs: 4
+  max_retries_per_signature: 0
+  one_active_run: true
+  registry_path: /content/drive/MyDrive/supply_chain_research/experiment_registry_isomorph_sample_seed42.json
+  require_archive_validation: false
+  require_drive_authorization: true
+  require_pushed_commit: true
+  allow_execution: false
+  max_job_seconds: 7200
+  overall_max_seconds: 28800
+
+data:
+  processed_dir: /content/drive/MyDrive/supply_chain_research/experiments/isomorph_sample_seed42/processed_inventory
+  scaler: standard
+  train_ratio: 0.70
+  validation_ratio: 0.15
+  lookback: 14
+  horizon: 7
+  undirected_graph: false
+  use_residual_baseline: false
+  graph_edge_types: [directed_route]
+
+training:
+  batch_size: 4
+  epochs: 100
+  patience: 15
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  loss: huber
+  huber_delta: 1.0
+  scheduler_factor: 0.5
+  scheduler_patience: 8
+
+models:
+  temporal_only:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  spatial_only:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  stgt:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  adaptive_stgt:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+
+isomorph:
+  raw_root: /content/drive/MyDrive/supply_chain_research/isomorph_sample/output_item50
+  processed_target: aggregate_on_hand_inventory
+  target_definition: experiments/isomorph_sample_seed42/processed_inventory/target_definition.json
+  source_demand_file: demand_signals.npy
+  source_state_files: [inventory_history.parquet, backlog_history.parquet, intransit_history.parquet]
+  directed_routing_graph: true
+  date_anchor: '2000-01-01'
+
+outputs:
+  drive_artifact_root: /content/drive/MyDrive/supply_chain_research/experiments/isomorph_sample_seed42
+  checkpoint_dir: /content/drive/MyDrive/supply_chain_research/experiments/isomorph_sample_seed42/_controller/checkpoints
+  metrics_dir: /content/drive/MyDrive/supply_chain_research/experiments/isomorph_sample_seed42/_controller/metrics
+  predictions_dir: /content/drive/MyDrive/supply_chain_research/experiments/isomorph_sample_seed42/_controller/predictions
+  logs_dir: /content/drive/MyDrive/supply_chain_research/experiments/isomorph_sample_seed42/_controller/logs
