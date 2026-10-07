@@ -54,10 +54,11 @@ def test_synthetic_processed_files_validate(tmp_path):
 def test_chunked_preprocessing_uses_tiny_csvs_only(tmp_path):
     raw = tmp_path / "raw"
     raw.mkdir()
-    pd.DataFrame({"item_nbr": [1, 2], "family": ["FOOD", "DRINK"]}).to_csv(raw / "items.csv", index=False)
-    pd.DataFrame({"store_nbr": [1], "state": ["A"], "city": ["X"]}).to_csv(raw / "stores.csv", index=False)
+    pd.DataFrame({"item_nbr": [1, 2], "family": ["FOOD", "DRINK"], "class": [1, 2], "perishable": [0, 0]}).to_csv(raw / "items.csv", index=False)
+    pd.DataFrame({"store_nbr": [1], "state": ["A"], "city": ["X"], "type": ["D"], "cluster": [1]}).to_csv(raw / "stores.csv", index=False)
     pd.DataFrame({"id": [1, 2, 3, 4], "date": ["2020-01-01", "2020-01-01", "2020-01-02", "2020-01-02"],
-                  "store_nbr": [1, 1, 1, 1], "item_nbr": [1, 2, 1, 2], "unit_sales": [10, 5, -1, 2]}).to_csv(raw / "train.csv", index=False)
+                  "store_nbr": [1, 1, 1, 1], "item_nbr": [1, 2, 1, 2], "unit_sales": [10, 5, -1, 2],
+                  "onpromotion": [False] * 4}).to_csv(raw / "train.csv", index=False)
     output = tmp_path / "processed"
     report = preprocess(raw, output, "2020-01-01", "2020-01-04", chunksize=1)
     sales = pd.read_csv(output / "sales.csv")
@@ -72,11 +73,12 @@ def test_chunked_preprocessing_uses_tiny_csvs_only(tmp_path):
 def test_raw_validator_accepts_csvs_and_checks_train_schema(tmp_path):
     from orchestrator import validate_archives
     from src.raw_data import SOURCE_STEMS
+    from src.source_schema import SCHEMAS
     for stem in SOURCE_STEMS:
-        (tmp_path / f"{stem}.csv").write_text("fixture\n")
+        (tmp_path / f"{stem}.csv").write_text(",".join(sorted(SCHEMAS[stem])) + "\n")
     (tmp_path / "items.csv").write_text("item_nbr,family,class,perishable\n1,FOOD,1,0\n")
     (tmp_path / "stores.csv").write_text("store_nbr,city,state,type,cluster\n1,X,A,D,1\n")
-    (tmp_path / "train.csv").write_text("id,date,store_nbr,item_nbr,unit_sales\n1,2020-01-01,1,1,5\n")
+    (tmp_path / "train.csv").write_text("id,date,store_nbr,item_nbr,unit_sales,onpromotion\n1,2020-01-01,1,1,5,False\n")
     manifest = validate_archives(tmp_path)
     assert len(manifest["files"]) == 8
     assert all(entry["name"].endswith(".csv") for entry in manifest["files"])
@@ -115,12 +117,13 @@ def test_model_forward_shapes():
     torch = pytest.importorskip("torch")
     pytest.importorskip("torch_geometric")
     from gat_lstm import AdaptiveFusionGATLSTM
-    from stgt import ReferenceSTGT
+    from stgt import AdaptiveSTGT, ReferenceSTGT
 
     x = torch.randn(2, 4, 5, 1)
     edges = torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]], dtype=torch.long)
     node_types = torch.tensor([0, 1, 2, 3], dtype=torch.long)
     stgt = ReferenceSTGT(lookback=5, horizon=3, d_model=16, temporal_heads=2, spatial_heads=2)
+    adaptive_stgt = AdaptiveSTGT(lookback=5, horizon=3, d_model=16, temporal_heads=2, spatial_heads=2)
     gat_lstm = AdaptiveFusionGATLSTM(
         lookback=5,
         horizon=3,
@@ -131,6 +134,7 @@ def test_model_forward_shapes():
         lstm_layers=2,
     )
     stgt.eval()
+    adaptive_stgt.eval()
     gat_lstm.eval()
     with torch.no_grad():
         prediction = stgt(x, edges, node_types)
@@ -138,10 +142,41 @@ def test_model_forward_shapes():
         assert torch.isfinite(torch.nn.functional.huber_loss(prediction, torch.zeros_like(prediction)))
         separate = torch.cat([stgt(x[i:i+1], edges, node_types) for i in range(2)])
         assert torch.allclose(prediction, separate, atol=1e-5)
+        adaptive_prediction, temporal_weight, spatial_weight = adaptive_stgt(
+            x, edges, node_types, return_attention=True
+        )
+        assert tuple(adaptive_prediction.shape) == (2, 4, 3)
+        assert tuple(temporal_weight.shape) == (2, 4)
+        assert torch.allclose(temporal_weight + spatial_weight, torch.ones_like(temporal_weight))
+        separate = torch.cat([adaptive_stgt(x[i:i+1], edges, node_types) for i in range(2)])
+        assert torch.allclose(adaptive_prediction, separate, atol=1e-5)
         gat_prediction = gat_lstm(x, edges)
         assert tuple(gat_prediction.shape) == (2, 4, 3)
         separate = torch.cat([gat_lstm(x[i:i+1], edges) for i in range(2)])
         assert torch.allclose(gat_prediction, separate, atol=1e-5)
+
+
+def test_adaptive_stgt_backward_reaches_temporal_spatial_and_gate():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+    from stgt import AdaptiveSTGT
+
+    torch.manual_seed(42)
+    x = torch.randn(2, 4, 5, 1)
+    edges = torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]], dtype=torch.long)
+    node_types = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    model = AdaptiveSTGT(lookback=5, horizon=3, d_model=16, temporal_heads=2, spatial_heads=2)
+    prediction = model(x, edges, node_types)
+    loss = torch.nn.functional.huber_loss(prediction, torch.zeros_like(prediction))
+    loss.backward()
+
+    gate_gradients = [parameter.grad for parameter in model.fusion.gate.parameters()]
+    assert any(gradient is not None and torch.isfinite(gradient).all() and gradient.abs().sum() > 0
+               for gradient in gate_gradients)
+    temporal_gradients = [parameter.grad for parameter in model.temporal_encoder.parameters()]
+    spatial_gradients = [parameter.grad for parameter in model.conv1.parameters()]
+    assert any(gradient is not None and gradient.abs().sum() > 0 for gradient in temporal_gradients)
+    assert any(gradient is not None and gradient.abs().sum() > 0 for gradient in spatial_gradients)
 
 
 def test_atomic_checkpoint_and_rng_round_trip(tmp_path):
@@ -163,3 +198,35 @@ def test_scaler_uses_training_prefix_only():
     _, state = fit_scale_matrix(series, train_end=2)
     assert state["center"] == [2.0]
     assert state["scale"] == [1.0]
+
+
+def test_interrupted_checkpoint_restores_optimizer_scheduler_and_rng_without_training(tmp_path):
+    torch = pytest.importorskip("torch")
+    from checkpointing import atomic_torch_save, capture_rng_state, restore_rng_state
+    # No optimizer step, backward pass or real data: populate synthetic state.
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+    for parameter in model.parameters():
+        optimizer.state[parameter] = {"step": torch.tensor(2.), "exp_avg": torch.zeros_like(parameter),
+                                      "exp_avg_sq": torch.ones_like(parameter)}
+    scheduler.best = 0.3
+    scheduler.num_bad_epochs = 2
+    weights = {name: value.clone() for name, value in model.state_dict().items()}
+    rng = capture_rng_state()
+    atomic_torch_save({"epoch": 2, "state_dict": weights, "optimizer": optimizer.state_dict(),
+                       "scheduler": scheduler.state_dict(), "rng_state": rng}, tmp_path / "latest.pt")
+    expected = torch.rand(3)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(100)  # simulate uncommitted work after the checkpoint
+    restored = torch.load(tmp_path / "latest.pt", weights_only=False)
+    model.load_state_dict(restored["state_dict"])
+    optimizer.load_state_dict(restored["optimizer"])
+    scheduler.load_state_dict(restored["scheduler"])
+    restore_rng_state(restored["rng_state"])
+    assert torch.equal(torch.rand(3), expected)
+    assert all(torch.equal(model.state_dict()[name], value) for name, value in weights.items())
+    assert optimizer.param_groups[0]["lr"] == 0.0005
+    assert scheduler.best == 0.3 and scheduler.num_bad_epochs == 2
+    assert restored["epoch"] + 1 == 3

@@ -1,5 +1,6 @@
 """Tiny subprocess tests for live logging; no dataset/model/experiment runs."""
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,16 @@ class ProcessLoggingTests(unittest.TestCase):
         result = run_logged([sys.executable, "-c", "raise SystemExit(3)"],
                             cwd=self.root, log_path=self.root / "failure.log", timeout=5, output=io.StringIO())
         self.assertEqual(result.returncode, 3)
+
+    @unittest.skipUnless(os.name == "posix", "Colab/Linux process-group behavior")
+    def test_timeout_stops_descendant_after_parent_has_exited(self):
+        code = "import subprocess, sys; subprocess.Popen([sys.executable, '-u', '-c', \"import time; print('child', flush=True); time.sleep(20)\"]); print('parent exits', flush=True)"
+        start = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_logged([sys.executable, "-u", "-c", code], cwd=self.root,
+                       log_path=self.root / "descendant.log", timeout=1, output=io.StringIO())
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertIn("child", (self.root / "descendant.log").read_text())
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.experiment_registry import BudgetExceeded, Registry, experiment_signature  # noqa: E402
+from orchestrator import compatible_model_configuration  # noqa: E402
 
 
 def _identity(model: str = "stgt"):
@@ -89,3 +90,24 @@ def test_interrupted_run_can_be_explicitly_retried(tmp_path):
     )
     assert second["record"]["attempt"] == 2
     assert registry.status()["submitted_runs"] == 2
+
+
+def test_adding_a_comparison_model_does_not_invalidate_verified_existing_model():
+    old = {
+        "seed": 42,
+        "deterministic": True,
+        "data": {"processed_dir": "/drive/processed", "horizon": 7, "lookback": 14},
+        "training": {"loss": "huber", "epochs": 100},
+        "models": {"stgt": {"d_model": 64}, "gat_lstm": {"gat_hidden": 48}},
+    }
+    new = {
+        **old,
+        "models": {
+            **old["models"],
+            "adaptive_stgt": {"d_model": 64},
+        },
+    }
+    assert compatible_model_configuration(old, new, "stgt")
+    assert compatible_model_configuration(old, new, "gat_lstm")
+    changed = {**new, "data": {**new["data"], "horizon": 14}}
+    assert not compatible_model_configuration(old, changed, "stgt")

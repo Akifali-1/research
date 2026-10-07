@@ -17,7 +17,9 @@ def atomic_torch_save(payload, path):
     temporary = Path(name)
     try:
         torch.save(payload, temporary)
-        with temporary.open("rb") as handle:
+        # Windows requires a writable descriptor for fsync; the file is only
+        # read by torch.save before this durability barrier.
+        with temporary.open("rb+") as handle:
             os.fsync(handle.fileno())
         temporary.replace(path)
     finally:

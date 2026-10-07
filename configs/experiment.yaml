@@ -1,4 +1,5 @@
 seed: 42
+seeds: [42, 123, 2026]
 deterministic: true
 
 experiment:
@@ -43,6 +44,11 @@ training:
 
 models:
   stgt:
+    d_model: 64
+    temporal_heads: 2
+    spatial_heads: 4
+    dropout: 0.30
+  adaptive_stgt:
     d_model: 64
     temporal_heads: 2
     spatial_heads: 4

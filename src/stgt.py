@@ -40,6 +40,41 @@ class TemporalAttention(nn.Module):
         return self.output_pooling(x.transpose(1, 2)).squeeze(-1)
 
 
+class AdaptiveSTGTFusion(nn.Module):
+    """Learn a per-node scalar gate between STGT temporal and spatial states.
+
+    Both branches have width ``d_model`` in the reference STGT, so the fusion
+    is deliberately limited to normalization, a small gate network, and a
+    convex weighted sum. It does not construct new graph edges or add another
+    attention mechanism.
+    """
+
+    def __init__(self, d_model: int, dropout: float):
+        super().__init__()
+        self.temporal_norm = nn.LayerNorm(d_model)
+        self.spatial_norm = nn.LayerNorm(d_model)
+        self.gate = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, temporal: torch.Tensor, spatial: torch.Tensor):
+        if temporal.shape != spatial.shape:
+            raise ValueError("Adaptive STGT branches must have identical shapes")
+        temporal = self.temporal_norm(temporal)
+        spatial = self.spatial_norm(spatial)
+        temporal_weight = self.gate(torch.cat([temporal, spatial], dim=-1)).squeeze(-1)
+        spatial_weight = 1.0 - temporal_weight
+        fused = (
+            temporal_weight.unsqueeze(-1) * temporal
+            + spatial_weight.unsqueeze(-1) * spatial
+        )
+        return fused, temporal_weight, spatial_weight
+
+
 class ReferenceSTGT(nn.Module):
     """Project-reference Spatio-Temporal Graph Transformer baseline.
 
@@ -97,6 +132,47 @@ class ReferenceSTGT(nn.Module):
         hidden = F.dropout(hidden, p=self.dropout_rate, training=self.training)
         output = self.fc(hidden)
         return output.reshape(batch_size, num_nodes, self.horizon)
+
+
+class AdaptiveSTGT(ReferenceSTGT):
+    """Reference STGT with focused adaptive temporal/spatial fusion."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fusion = AdaptiveSTGTFusion(self.d_model, self.dropout_rate)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        node_types: torch.Tensor,
+        return_attention: bool = False,
+    ):
+        if x.ndim != 4:
+            raise ValueError("Adaptive STGT expects x with shape [batch, nodes, lookback, channels]")
+        batch_size, num_nodes, lookback, _ = x.shape
+        if lookback != self.lookback:
+            raise ValueError(f"Expected lookback={self.lookback}, received {lookback}")
+        if node_types.shape[0] != num_nodes:
+            raise ValueError("node_types must contain one value per graph node")
+
+        temporal = self.temporal_encoder(x.reshape(batch_size * num_nodes, lookback, -1))
+        types = self.type_embedding(node_types).repeat(batch_size, 1)
+        temporal = temporal + types
+        batched_edges = repeat_edge_index(edge_index, batch_size, num_nodes)
+        spatial = F.elu(self.conv1(temporal, batched_edges))
+        spatial = F.dropout(spatial, p=self.dropout_rate, training=self.training)
+        spatial = F.elu(self.conv2(spatial, batched_edges))
+        spatial = F.dropout(spatial, p=self.dropout_rate, training=self.training)
+        fused, temporal_weight, spatial_weight = self.fusion(temporal, spatial)
+        output = self.fc(fused).reshape(batch_size, num_nodes, self.horizon)
+        if return_attention:
+            return (
+                output,
+                temporal_weight.reshape(batch_size, num_nodes),
+                spatial_weight.reshape(batch_size, num_nodes),
+            )
+        return output
 
 
 # Backward-compatible descriptive alias for experiment configuration.

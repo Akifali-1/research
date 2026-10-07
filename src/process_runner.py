@@ -12,12 +12,16 @@ from pathlib import Path
 
 
 def _stop(process):
-    if process.poll() is not None:
-        return
     if os.name == "posix":
-        os.killpg(process.pid, signal.SIGTERM)
+        # A parent may already have exited while its child still holds the
+        # stdout pipe (or GPU). Terminate the session group, not just the parent.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     else:
-        process.terminate()
+        if process.poll() is None:
+            process.terminate()
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:

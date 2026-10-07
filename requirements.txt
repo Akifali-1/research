@@ -6,5 +6,5 @@ torch>=2.1
 torch-geometric>=2.4
 matplotlib>=3.7
 seaborn>=0.12
-py7zr>=0.20
+py7zr>=1.0,<2
 pytest>=7.4

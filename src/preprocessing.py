@@ -12,11 +12,19 @@ import argparse
 import json
 import re
 import shutil
+import tempfile
 import unicodedata
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+if __package__:
+    from .integrity import atomic_json, fingerprint
+    from .source_schema import validate_source_schema
+else:
+    from integrity import atomic_json, fingerprint
+    from source_schema import validate_source_schema
 
 
 def slug(value):
@@ -30,34 +38,69 @@ def materialize_csv(raw_dir, filename, cache_dir=None):
     archive_path = raw_dir / f"{filename}.7z"
     # Match preflight's source preference when CSV and 7z are both present.
     if original.is_file() and not archive_path.is_file():
+        validate_source_schema(original, filename[:-4])
         return original
     cache = Path(cache_dir) if cache_dir else raw_dir
-    extracted = cache / filename
     if not archive_path.is_file():
         raise FileNotFoundError(archive_path)
     import py7zr
+    archive_hash = fingerprint(archive_path)["sha256"]
+    # Source-content namespace avoids reusing a CSV from a different archive.
+    cache = cache / ".verified-csv" / archive_hash
     cache.mkdir(parents=True, exist_ok=True)
+    extracted = cache / filename
+    checksum_path = cache / f"{filename}.integrity.json"
+    active_path = cache / "active.json"
+    if active_path.exists():
+        relative = Path(json.loads(active_path.read_text(encoding="utf-8"))["path"])
+        if relative.is_absolute() or ".." in relative.parts or relative.name != filename:
+            raise ValueError("Unsafe cache pointer")
+        extracted = cache / relative
+        checksum_path = extracted.with_name(f"{filename}.integrity.json")
     with py7zr.SevenZipFile(archive_path, "r") as archive:
         members = archive.list()
         if len(members) != 1 or members[0].filename != filename:
             raise ValueError(f"Unexpected archive members: {archive_path}")
         if extracted.is_file():
-            if extracted.stat().st_size != members[0].uncompressed:
-                raise ValueError(f"Incomplete cached CSV: {extracted}; preserve and inspect it")
-            return extracted
+            if checksum_path.exists():
+                try:
+                    recorded = json.loads(checksum_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeError):
+                    recorded = None
+                actual = fingerprint(extracted)
+                if (isinstance(recorded, dict) and recorded.get("archive_sha256") == archive_hash
+                        and recorded.get("csv") == actual
+                        and actual["bytes"] == members[0].uncompressed
+                        and (members[0].crc32 is None or actual["crc32"] == members[0].crc32)):
+                    validate_source_schema(extracted, filename[:-4])
+                    return extracted
+            # Preserve suspect/orphaned cache versions. The new verified
+            # extraction below gets its own unique directory instead.
+            extracted = None
         if shutil.disk_usage(cache).free < members[0].uncompressed * 1.1:
             raise RuntimeError(f"Insufficient free space to extract {filename} into {cache}")
-        # Extraction into an attempt directory prevents trusting partial files
-        # after a disconnected runtime. No source or cached files are deleted.
-        staging = cache / f".{filename}.extracting"
-        staging.mkdir(exist_ok=False)
-        archive.extractall(path=staging)
-    candidate = staging / filename
-    if candidate.stat().st_size != members[0].uncompressed:
-        raise ValueError(f"Incomplete archive extraction: {candidate}")
-    candidate.replace(extracted)
-    staging.rmdir()
-    return extracted
+        with tempfile.TemporaryDirectory(prefix=".extract-", dir=cache) as folder:
+            staging = Path(folder)
+            archive.extractall(path=staging)
+            candidate = staging / filename
+            actual = fingerprint(candidate)
+            if actual["bytes"] != members[0].uncompressed:
+                raise ValueError(f"Incomplete archive extraction: {candidate}")
+            if members[0].crc32 is not None and actual["crc32"] != members[0].crc32:
+                raise ValueError(f"Archive CRC mismatch: {candidate}")
+            validate_source_schema(candidate, filename[:-4])
+            atomic_json(staging / f"{filename}.integrity.json", {"archive_sha256": archive_hash, "csv": actual})
+            if extracted is not None and not extracted.exists():
+                # Promote the file atomically, then its checksum. An interrupted
+                # promotion without a checksum is never trusted on the next run.
+                candidate.replace(extracted)
+                (staging / f"{filename}.integrity.json").replace(checksum_path)
+                return extracted
+            # Recover around a suspect existing cache without deleting it.
+            recovered = cache / f"verified-{staging.name.removeprefix('.extract-')}"
+            staging.rename(recovered)
+            atomic_json(active_path, {"path": str((recovered / filename).relative_to(cache))})
+            return recovered / filename
 
 
 def load_metadata(raw_dir, cache_dir=None):

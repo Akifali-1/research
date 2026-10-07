@@ -1,12 +1,13 @@
-# Adaptive Fusion GAT-LSTM for Interpretable Supply Chain Demand Forecasting
+# Adaptive STGT vs Adaptive Fusion GAT-LSTM for Interpretable Supply Chain Demand Forecasting
 
 Semi-automated, reproducible comparison against a **project-reference STGT**.
 Code lives in GitHub; datasets/artifacts live in Google Drive; large processing
 and model experiments run in an interactively authorized Google Colab session.
 
-**Status:** source prepared locally; GitHub push requires user authentication.
-No real preprocessing, GPU training, or test-set evaluation has been run. No
-result or model superiority is claimed. See `RESEARCH_STATUS.md` for limitations.
+**Status:** Adaptive STGT implementation and pipeline integration are prepared
+locally. No new preprocessing, GPU training, or test-set evaluation has been
+run by this agent. No result or model superiority is claimed. See
+`RESEARCH_STATUS.md` for the artifact audit and limitations.
 
 ## Structure
 
@@ -80,9 +81,10 @@ MyDrive/supply_chain_research/
     └── final_test/                # frozen selection, test predictions/report
 ```
 
-The Colab preflight hashes the selected CSV or 7z sources, checks inner member names/sizes, and
-extracts only small compressed metadata to verify schemas. Direct CSV schemas
-are inspected from their headers. When both representations exist, 7z is the
+The Colab preflight hashes the selected CSV or 7z sources, checks inner member names/sizes,
+and validates the schemas of all eight files through bounded header reads.
+Compressed train/test headers are decoded without extracting their complete
+CSV bodies. When both representations exist, 7z is the
 consistent preference of preflight and preprocessing. This is **not** a claim of a
 full CRC scan of the large train archive. Its full extraction in Colab checks
 integrity before a processed completion marker can exist or training can start.
@@ -122,6 +124,10 @@ labeled date, never at a manufactured future zero-filled date.
 | `data_quality.json` | date range, counts, policies, graph/source validation information |
 
 CSV extraction uses a Colab-local cache; raw Drive archives remain unchanged.
+Cached CSVs are source-hash-namespaced, CRC/SHA-256 verified, and checked against
+recorded checksums on every reuse. Unique temporary extraction directories
+prevent a stale extraction directory from blocking recovery. Suspect existing
+cache files are preserved; only this invocation's failed scratch is cleaned.
 Processed outputs are versioned. Completed versions are hash-verified and
 reused. Incomplete preprocessing stops for inspection; choose a new processed
 base for an explicit restart, keeping the incomplete logs.
@@ -148,6 +154,12 @@ head. The horizon extension changes the output from one value to `H` values.
 No identified original STGT paper has been verified; this is transparently a
 project-reference baseline, not a claimed published-model reproduction.
 
+**AdaptiveSTGT:** the same reference STGT temporal encoder, node-type metadata,
+graph layers, and direct forecast head, with one learned per-node scalar gate
+between its temporal-with-metadata state and spatial graph state. The gate uses
+branch normalization and a compact MLP; its two weights sum to one. It does
+not add learned graph construction or another temporal-attention module.
+
 **AdaptiveFusionGATLSTM:** supplied optimized design: BiLSTM, temporal
 attention pooling, LayerNorm, stacked multi-head GAT with projected residual,
 adaptive scalar temporal/spatial fusion gate, and prediction MLP. Temporal
@@ -163,7 +175,7 @@ does not. Edge labels are documented but unused by both initial spatial layers.
 
 Initial protocol (`configs/experiment.yaml`):
 
-- seed 42, configurable;
+- seeds 42, 123, and 2026 for the initial three-seed comparison;
 - 14-day history and 7-day **direct** multi-step horizon;
 - chronological 70%/15%/15% train/validation/test;
 - all metadata nodes, identical forecast origins and targets;
@@ -188,7 +200,8 @@ settings warn rather than falsely guaranteeing identical GPU results.
 
 Hard caps: **10 submitted training attempts**, one active run, **2 retries** per
 signature. Failed/interrupted submitted attempts also consume slots. Rejected
-preflight attempts do not. The initial two model runs are inside the ten slots.
+preflight attempts do not. The initial three-model × three-seed campaign uses
+nine slots before retries.
 No automatic budget increases or paid resources are used.
 
 Job limit: 7200 seconds. Campaign limit: 21600 seconds from its first training
@@ -220,6 +233,10 @@ running process from an older commit retains its original logging behavior.
 ## Notebook stages
 
 Open `notebooks/colab_experiment.ipynb` from branch `research/initial-pipeline`.
+The Adaptive STGT campaign uses the separate Drive registry
+`experiment_registry_adaptive_stgt_campaign.json` and artifact root
+`experiments/adaptive_stgt_campaign/`; the original two-model registry and
+frozen final-test directory remain preserved.
 
 1. Clone/reuse the repository and verify clean source matches the pushed branch.
 2. Mount Drive **interactively**. Upload the archives if absent.
@@ -228,13 +245,15 @@ Open `notebooks/colab_experiment.ipynb` from branch `research/initial-pipeline`.
 5. Type `PREPROCESS` to prepare or verify the versioned processed dataset.
 6. Create the portable Drive-path experiment configuration.
 7. Type `RUN` for sequential validation-only training; `RETRY`/`RESTART` is explicit.
-8. Review validation reports. Type `TEST` and choose the two completed run IDs
-   only after configurations are final. The selection is frozen before test
-   access. Final artifacts are verified/reused, not overwritten.
+8. Review validation reports. Type `TEST` and choose one completed run ID for
+   every model and configured seed only after configurations are final. The
+   selection is frozen before test access. Final artifacts are verified/reused,
+   not overwritten.
 
-Final outputs: `experiments/final_test/metrics/model_comparison.csv`,
-per-type/per-horizon JSON, `comparison_report.md`, `comparison.png`, and test
-prediction NPZ files with node names, dates, and target indices. No metrics are
+Final outputs: `experiments/final_test/stages/report/model_comparison.csv`,
+`model_comparison_summary.csv`, per-type/per-horizon JSON, `comparison_report.md`,
+`comparison.png`, and test per-model/seed
+`stages/<model>_seed<seed>/predictions.npz` files with node names, dates, and target indices. No metrics are
 invented; these files appear only after the actual authorized evaluation.
 
 Metrics are calculated on original units with predictions clipped to zero:
@@ -283,3 +302,12 @@ authorize writing to the repository.
 There is no tested direct Colab API/MCP/Drive integration in this environment.
 The first Drive authorization is a user action. This project prepares and
 controls an authorized session; **unattended remote execution is not claimed**.
+
+## Reliability review and final-test recovery
+
+See `RELIABILITY_REVIEW.md` for the verified bug/design classification and exact
+recovery procedure. The final-test cell accepts `EVAL_RESUME` for an interrupted
+evaluation of the same frozen model/seed selection. It verifies and reuses completed model
+stages and runs only missing stages. Corrupt completed results are never silently
+replaced. A compatible evaluation-only code upgrade for older checkpoints needs
+explicit `COMPATIBLE_UPGRADE`; training provenance remains unchanged.
