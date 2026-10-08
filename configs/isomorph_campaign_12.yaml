@@ -1,0 +1,77 @@
+data:
+  graph_edge_types:
+  - directed_route
+  horizon: 7
+  lookback: 14
+  processed_dir: /kaggle/input/datasets/mohdakifaliparvez/isomorph-sample-processed/processed_inventory
+  scaler: standard
+  train_ratio: 0.7
+  undirected_graph: false
+  use_residual_baseline: false
+  validation_ratio: 0.15
+deterministic: true
+experiment:
+  allow_execution: true
+  max_gpu_runs: 4
+  max_job_seconds: 7200
+  max_retries_per_signature: 0
+  name: isomorph_sample_campaign
+  one_active_run: true
+  overall_max_seconds: 28800
+  registry_path: /kaggle/working/experiment_registry_isomorph_campaign.json
+  require_archive_validation: false
+  require_drive_authorization: false
+  require_pushed_commit: true
+isomorph:
+  date_anchor: '2000-01-01'
+  directed_routing_graph: true
+  processed_target: aggregate_on_hand_inventory
+  raw_root: /content/drive/MyDrive/supply_chain_research/isomorph_sample/output_item50
+  source_demand_file: demand_signals.npy
+  source_state_files:
+  - inventory_history.parquet
+  - backlog_history.parquet
+  - intransit_history.parquet
+  target_definition: experiments/isomorph_sample_seed42/processed_inventory/target_definition.json
+models:
+  adaptive_stgt:
+    d_model: 64
+    dropout: 0.3
+    spatial_heads: 4
+    temporal_heads: 2
+  spatial_only:
+    d_model: 64
+    dropout: 0.3
+    spatial_heads: 4
+    temporal_heads: 2
+  stgt:
+    d_model: 64
+    dropout: 0.3
+    spatial_heads: 4
+    temporal_heads: 2
+  temporal_only:
+    d_model: 64
+    dropout: 0.3
+    spatial_heads: 4
+    temporal_heads: 2
+outputs:
+  checkpoint_dir: /kaggle/working/isomorph_sample_campaign/_controller/checkpoints
+  drive_artifact_root: /kaggle/working/isomorph_sample_campaign
+  logs_dir: /kaggle/working/isomorph_sample_campaign/_controller/logs
+  metrics_dir: /kaggle/working/isomorph_sample_campaign/_controller/metrics
+  predictions_dir: /kaggle/working/isomorph_sample_campaign/_controller/predictions
+  log_dir: /kaggle/working/isomorph_campaign/seed42/temporal_only/logs
+seed: 42
+seeds:
+- 42
+training:
+  batch_size: 4
+  epochs: 100
+  gradient_clip_norm: 1.0
+  huber_delta: 1.0
+  learning_rate: 0.001
+  loss: huber
+  patience: 15
+  scheduler_factor: 0.5
+  scheduler_patience: 8
+  weight_decay: 0.0001
