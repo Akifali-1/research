@@ -162,10 +162,12 @@ def main():
             run_config["data"]["processed_dir"] = str(processed)
             signature = make_signature(model, run_config, commit, manifest)
             existing = registry.reserve(model, seed, signature, run_config, commit, manifest, artifact_root)
-        if existing.get("status") == "completed":
-            print(f"Skipped completed ISOMORPH run: {existing['experiment_id']}", flush=True)
-            continue
-        experiment_id = existing["experiment_id"]
+
+            if existing.get("status") == "completed":
+                print(f"Skipped completed ISOMORPH run: {existing['experiment_id']}", flush=True)
+                continue
+
+            experiment_id = existing["experiment_id"]
         artifact = Path(existing["artifact_dir"])
         artifact.mkdir(parents=True, exist_ok=False)
         run_config["outputs"].update({"checkpoint_dir": str(artifact / "checkpoints"), "metrics_dir": str(artifact / "metrics"),
